@@ -78,7 +78,7 @@ class CommandExecutor:
     """Executes commands on SSH sessions."""
 
     def __init__(
-        self, session_manager: SSHSessionManager, config: None | ServerConfig = None
+        self, session_manager: SSHSessionManager, config: ServerConfig | None = None
     ):
         from .api_types import ServerConfig
 
