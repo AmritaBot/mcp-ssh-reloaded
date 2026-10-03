@@ -122,7 +122,7 @@ def streaming_manager(mock_ssh_client):
         ),
         patch.object(manager, "_get_or_create_shell", return_value=shell),
         patch.object(
-            manager,
+            manager.command_executor,
             "_execute_standard_command_internal",
             side_effect=fake_streaming_execute,
         ),

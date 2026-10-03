@@ -84,16 +84,18 @@ class TestConcurrency:
 
         # 3. Try write_file with use_sudo=True (forces shell usage)
         print("Attempting to write file with sudo immediately (should fail)...")
-        _msg, stderr, exit_code = session_manager.write_file(
-            host=ssh_config["host"],
-            username=ssh_config["username"],
-            password=ssh_config["password"],
-            key_filename=ssh_config["key_filename"],
-            port=ssh_config["port"],
-            remote_path="/tmp/mcp_test_concurrent.txt",
-            content="test",
-            use_sudo=True,  # Forces shell usage
-            sudo_password="placeholder",
+        _msg, stderr, exit_code = asyncio.run(
+            session_manager.write_file(
+                host=ssh_config["host"],
+                username=ssh_config["username"],
+                password=ssh_config["password"],
+                key_filename=ssh_config["key_filename"],
+                port=ssh_config["port"],
+                remote_path="/tmp/mcp_test_concurrent.txt",
+                content="test",
+                use_sudo=True,  # Forces shell usage
+                sudo_password="placeholder",
+            )
         )
 
         print(f"Write result: code={exit_code}, stderr={stderr}")
