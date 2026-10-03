@@ -88,8 +88,7 @@ class SessionRegistry:
         self.enable_mode.pop(session_key, None)
         with self._exec_locks_guard:
             lock = self._exec_locks.get(session_key)
-            # Keep the lock if a worker still holds it - dropping it would
-            # let a second reader onto the same channel.
+            # Keep the lock while a worker holds it, or a reader could slip in.
             if lock is None or not lock.locked():
                 self._exec_locks.pop(session_key, None)
         for key in [

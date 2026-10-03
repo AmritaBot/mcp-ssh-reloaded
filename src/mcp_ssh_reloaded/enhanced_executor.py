@@ -116,8 +116,7 @@ class EnhancedCommandExecutor:
         with self._lock:
             self._commands[command_id] = command
 
-        # The executor keeps a timed-out command alive in background monitoring,
-        # so "auto-extend" is simply how long we are prepared to wait for it.
+        # The executor keeps a timed-out command alive, so auto-extend is patience.
         budget = max_timeout if auto_extend_timeout else timeout
         deadline = time.monotonic() + budget
         last_progress = time.monotonic()
@@ -246,6 +245,5 @@ class EnhancedCommandExecutor:
         return data
 
 
-# Re-exported so ``from .enhanced_executor import CommandStatus`` style imports
-# keep resolving while callers migrate to the shared model module.
+# Re-exported for callers that still import CommandStatus from here.
 __all__ = ["CommandStatus", "EnhancedCommandExecutor"]

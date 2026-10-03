@@ -27,9 +27,7 @@ if TYPE_CHECKING:
     import paramiko
 
 
-# ---------------------------------------------------------------------------
 # Identity & connection
-# ---------------------------------------------------------------------------
 
 
 class DeviceFamily(Enum):
@@ -92,9 +90,7 @@ class ConnectionParams:
         return ConnectionParams(**d)
 
 
-# ---------------------------------------------------------------------------
 # Execution results
-# ---------------------------------------------------------------------------
 
 
 class CommandStatus(Enum):
@@ -130,9 +126,7 @@ class FileContent:
     max_bytes: int = 0
 
 
-# ---------------------------------------------------------------------------
 # Session lifecycle
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -224,9 +218,7 @@ class ConnectionProfile:
     connection_health: str = "unknown"  # "healthy", "degraded", "dead"
 
 
-# ---------------------------------------------------------------------------
 # Server config
-# ---------------------------------------------------------------------------
 
 
 class ServerConfig(BaseSettings):
@@ -267,9 +259,7 @@ class ServerConfig(BaseSettings):
     async_default_timeout: int = 30
 
 
-# ---------------------------------------------------------------------------
 # Error types
-# ---------------------------------------------------------------------------
 
 
 class ErrorCategory(Enum):

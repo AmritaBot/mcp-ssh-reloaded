@@ -207,8 +207,7 @@ class CommandExecutor:
                 status=CommandStatus.FAILED, stderr=str(e), exit_code=1
             )
 
-        # Package manager installs/upgrades commonly exceed MCP client-side call
-        # timeouts, so they are handed straight back for the caller to poll.
+        # Package managers can outlive a client timeout, so hand them back to poll.
         if self._should_start_async_immediately(command):
             logger.info(f"[EXEC_ASYNC_IMMEDIATE] command_id={command_id}")
             return ExecutionResult(
@@ -266,8 +265,7 @@ class CommandExecutor:
 
             await asyncio.sleep(0.1)
 
-        # The command outlived this call's timeout; the executor keeps it alive
-        # in background monitoring, so report it as still running.
+        # Outlived this call's timeout; the executor keeps it alive in the background.
         logger.warning(
             f"[EXEC_TIMEOUT] Command {command_id} timed out after {timeout}s"
         )
@@ -476,9 +474,7 @@ class CommandExecutor:
         logger = self.logger.getChild("async_worker")
         logger.debug(f"[WORKER_START] command_id={command_id}")
 
-        # Only one read loop may hold a session's shell at a time.  The
-        # previous holder is signalled to stop by interrupt/auto-recovery,
-        # so this normally returns almost immediately.
+        # Only one read loop may hold a session's shell at a time.
         exec_lock = self._sm.registry.execution_lock(session_key)
         exec_lock.acquire()
         output_buffer = self._new_output_buffer()
@@ -706,8 +702,7 @@ class CommandExecutor:
             shell_to_interrupt = cmd.shell
             cmd.status = CommandStatus.INTERRUPTED
             cmd.end_time = datetime.now()
-            # Stop the worker's read loop too, otherwise it keeps draining
-            # the channel and starves the next command.
+            # Stop the worker's read loop, or it starves the next command.
             cmd.monitoring_cancelled.set()
 
         if shell_to_interrupt:
@@ -882,8 +877,7 @@ class CommandExecutor:
         last_recv_time = time.time()
         start_time = time.time()
 
-        # Seed the buffer with output collected before monitoring started,
-        # so a spill file really does hold the whole stream.
+        # Seed the buffer so a spill file really does hold the whole stream.
         output_buffer = self._new_output_buffer()
         output_buffer.add_chunk(cmd.stdout)
 
@@ -1173,8 +1167,7 @@ class CommandExecutor:
         last_recv_time = time.time()
         start_time = time.time()
 
-        # Seed the buffer with output collected before monitoring started,
-        # so a spill file really does hold the whole stream.
+        # Seed the buffer so a spill file really does hold the whole stream.
         output_buffer = self._new_output_buffer()
         output_buffer.add_chunk(cmd.stdout)
 
@@ -1534,10 +1527,6 @@ class CommandExecutor:
                 cmd.monitoring_cancelled.set()
 
             self._commands.clear()
-
-    # ------------------------------------------------------------------
-    # Execution internals (moved out of SSHSessionManager)
-    # ------------------------------------------------------------------
 
     def _execute_sudo_command_internal(
         self,
