@@ -80,6 +80,8 @@ class SSHService:
                     exit_code=0,
                     status=CommandStatus.RUNNING,
                     command_id=result.command_id,
+                    truncated=result.truncated,
+                    spilled_path=result.spilled_path,
                 )
             if result.status is CommandStatus.AWAITING_INPUT:
                 return CommandResult(
@@ -88,12 +90,16 @@ class SSHService:
                     exit_code=0,
                     status=CommandStatus.AWAITING_INPUT,
                     command_id=result.command_id,
+                    truncated=result.truncated,
+                    spilled_path=result.spilled_path,
                 )
             return CommandResult(
                 stdout=result.stdout,
                 stderr=result.stderr,
                 exit_code=result.exit_code or 0,
                 duration_ms=_now_ms() - t0,
+                truncated=result.truncated,
+                spilled_path=result.spilled_path,
             )
         except ConnectionError as e:
             raise _to_ssh_error(e)

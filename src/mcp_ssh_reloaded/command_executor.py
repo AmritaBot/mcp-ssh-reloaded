@@ -124,6 +124,13 @@ class CommandExecutor:
         r"\braspi-config\b",
     ]
 
+    def _new_output_buffer(self) -> OutputBuffer:
+        """Buffer honouring the configured output cap and spill directory."""
+        return OutputBuffer(
+            max_size=self.config.max_output_bytes,
+            spill_dir=self.config.log_dir,
+        )
+
     def _mark_interpreter_exit(self):
         self._interpreter_exiting = True
 
@@ -238,6 +245,8 @@ class CommandExecutor:
                     command_id=command_id,
                     stdout=status.get("stdout", ""),
                     awaiting_input=reason,
+                    truncated=status.get("truncated", False),
+                    spilled_path=status.get("spilled_path"),
                 )
 
             if status["status"] != "running":
@@ -251,6 +260,8 @@ class CommandExecutor:
                     stdout=status["stdout"],
                     stderr=status["stderr"],
                     exit_code=status["exit_code"] or 0,
+                    truncated=status.get("truncated", False),
+                    spilled_path=status.get("spilled_path"),
                 )
 
             await asyncio.sleep(0.1)
@@ -470,7 +481,7 @@ class CommandExecutor:
         # so this normally returns almost immediately.
         exec_lock = self._sm.registry.execution_lock(session_key)
         exec_lock.acquire()
-        output_buffer = OutputBuffer(spill_dir=self.config.log_dir)
+        output_buffer = self._new_output_buffer()
         try:
             with self._lock:
                 if command_id not in self._commands:
@@ -548,6 +559,8 @@ class CommandExecutor:
                         running_cmd.stdout = result.stdout
                         running_cmd.stderr = result.stderr or "Command interrupted"
                         running_cmd.exit_code = result.exit_code
+                        running_cmd.truncated = output_buffer.truncated
+                        running_cmd.spilled_path = output_buffer.spilled_path
                         running_cmd.status = CommandStatus.INTERRUPTED
                         running_cmd.end_time = datetime.now()
                 return
@@ -560,6 +573,8 @@ class CommandExecutor:
                 with self._lock:
                     if command_id in self._commands:
                         running_cmd.stdout = result.stdout
+                        running_cmd.truncated = output_buffer.truncated
+                        running_cmd.spilled_path = output_buffer.spilled_path
                         # Preserve existing stderr if it has useful info (like Output limit exceeded)
                         timeout_msg = (
                             f"Command exceeded {timeout}s timeout, still running..."
@@ -607,6 +622,8 @@ class CommandExecutor:
                     running_cmd.stderr = result.stderr
                     running_cmd.exit_code = result.exit_code
                     running_cmd.awaiting_input_reason = result.awaiting_input
+                    running_cmd.truncated = output_buffer.truncated
+                    running_cmd.spilled_path = output_buffer.spilled_path
                     if result.status is CommandStatus.AWAITING_INPUT:
                         running_cmd.status = CommandStatus.AWAITING_INPUT
                         logger.info(
@@ -659,6 +676,8 @@ class CommandExecutor:
                 "start_time": cmd.start_time.isoformat(),
                 "end_time": cmd.end_time.isoformat() if cmd.end_time else None,
                 "awaiting_input_reason": cmd.awaiting_input_reason,
+                "truncated": cmd.truncated,
+                "spilled_path": cmd.spilled_path,
             }
             return status_payload
 
@@ -865,7 +884,7 @@ class CommandExecutor:
 
         # Seed the buffer with output collected before monitoring started,
         # so a spill file really does hold the whole stream.
-        output_buffer = OutputBuffer(spill_dir=self.config.log_dir)
+        output_buffer = self._new_output_buffer()
         output_buffer.add_chunk(cmd.stdout)
 
         last_log_time = 0.0
@@ -1156,7 +1175,7 @@ class CommandExecutor:
 
         # Seed the buffer with output collected before monitoring started,
         # so a spill file really does hold the whole stream.
-        output_buffer = OutputBuffer(spill_dir=self.config.log_dir)
+        output_buffer = self._new_output_buffer()
         output_buffer.add_chunk(cmd.stdout)
 
         last_log_time = 0.0
@@ -1566,9 +1585,7 @@ class CommandExecutor:
             shell.send((command + "\n").encode("utf-8"))
             time.sleep(0.5)
 
-            output_buffer = output_buffer or OutputBuffer(
-                spill_dir=self.config.log_dir
-            )
+            output_buffer = output_buffer or self._new_output_buffer()
             raw_output = ""
             password_sent = False
             start_time = time.time()
@@ -1728,9 +1745,7 @@ class CommandExecutor:
             shell.send((command_to_send + "\n").encode("utf-8"))
             time.sleep(0.3)
 
-            output_buffer = output_buffer or OutputBuffer(
-                spill_dir=self.config.log_dir
-            )
+            output_buffer = output_buffer or self._new_output_buffer()
             raw_output = ""
             start_time = time.time()
             last_recv_time = start_time
@@ -1781,9 +1796,7 @@ class CommandExecutor:
             self._sm._ensure_prompt_pattern(session_key, client, shell=shell)
             consecutive_misses = 0  # Track consecutive prompt detection failures
 
-            output_buffer = output_buffer or OutputBuffer(
-                spill_dir=self.config.log_dir
-            )
+            output_buffer = output_buffer or self._new_output_buffer()
             raw_output_chunks = []
 
             while time.time() - start_time < timeout:
@@ -2285,9 +2298,7 @@ class CommandExecutor:
             shell.send(f"{command}\n".encode())
             await asyncio.sleep(0.5)
 
-            output_buffer = output_buffer or OutputBuffer(
-                spill_dir=self.config.log_dir
-            )
+            output_buffer = output_buffer or self._new_output_buffer()
             raw_output = ""
             start_time = time.time()
             last_output_time = time.time()

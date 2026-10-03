@@ -117,6 +117,10 @@ async def execute_command(
         result += f"STDOUT:\n{r.stdout}\n"
     if r.stderr:
         result += f"STDERR:\n{r.stderr}\n"
+    if r.truncated:
+        result += "\n[OUTPUT TRUNCATED - head and tail only"
+        result += f"; full output saved to {r.spilled_path}]" if r.spilled_path else "]"
+        result += "\n"
     return result
 
 

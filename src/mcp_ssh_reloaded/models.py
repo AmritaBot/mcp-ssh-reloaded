@@ -117,6 +117,7 @@ class CommandResult:
     command_id: str | None = None
     duration_ms: float = 0.0
     truncated: bool = False
+    spilled_path: str | None = None
 
 
 @dataclass
@@ -201,6 +202,8 @@ class RunningCommand:
     streaming_mode: bool = False
     last_output_time: datetime | None = None
     output_chunks: list[str] = field(default_factory=list)  # For streaming mode
+    truncated: bool = False  # Output hit the cap; stdout is head+tail only
+    spilled_path: str | None = None  # Where the full stream was written
 
 
 @dataclass

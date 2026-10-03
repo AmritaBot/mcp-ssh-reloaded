@@ -39,9 +39,11 @@ class OutputBuffer:
         spill_dir: str | None = None,
     ):
         self.max_size = max_size
-        self.head_size = head_size
-        self.tail_size = tail_size
-        self.spill_threshold = spill_threshold
+        # The head/tail window can never be wider than the cap itself.
+        self.head_size = min(head_size, max_size // 2)
+        self.tail_size = min(tail_size, max_size - self.head_size)
+        # Spill well before the cap, even for very small caps.
+        self.spill_threshold = min(spill_threshold, max(1, max_size // 2))
         self.spill_dir = spill_dir
 
         self.current_size = 0
@@ -50,7 +52,6 @@ class OutputBuffer:
         self.spilled_path: str | None = None
 
         self._pending: list[str] = []
-        self._spill = None
 
     # -- collection --------------------------------------------------------
 
@@ -69,6 +70,7 @@ class OutputBuffer:
             chunk = chunk.encode("utf-8")[:remaining].decode("utf-8", "ignore")
             size = len(chunk.encode("utf-8"))
             self.hard_capped = True
+            self.truncated = True
 
         self.current_size += size
         if self.current_size > self.head_size + self.tail_size:
@@ -78,27 +80,40 @@ class OutputBuffer:
         return chunk, not self.hard_capped
 
     def _write(self, chunk: str) -> None:
-        if self._spill is not None:
-            self._spill.write(chunk)
-            self._spill.flush()
+        if self.spilled_path is None:
+            self._pending.append(chunk)
+            if self.current_size > self.spill_threshold:
+                self._open_spill()
             return
-        self._pending.append(chunk)
-        if self.current_size > self.spill_threshold:
-            self._open_spill()
+        self._append_to_spill(chunk)
 
     def _open_spill(self) -> None:
+        """Create the spill file and flush everything collected so far."""
         try:
             fd, path = tempfile.mkstemp(
                 prefix="mcp_ssh_output_", suffix=".log", dir=self.spill_dir
             )
-            self._spill = os.fdopen(fd, "w", encoding="utf-8", errors="replace")
+            with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as handle:
+                handle.write("".join(self._pending))
             self.spilled_path = path
-            for piece in self._pending:
-                self._spill.write(piece)
             self._pending.clear()
         except OSError:
             # Spilling is best-effort; keep collecting in memory instead.
-            self._spill = None
+            self.spilled_path = None
+
+    def _append_to_spill(self, chunk: str) -> None:
+        """Append one chunk, opening and closing the file each time.
+
+        Deliberately handle-free: an open descriptor outliving the command
+        is exactly the leak this replaced.
+        """
+        path = self.spilled_path
+        if path is None:
+            return
+        try:
+            with open(path, "a", encoding="utf-8", errors="replace") as handle:
+                handle.write(chunk)
+        except OSError:
             self.spilled_path = None
 
     # -- rendering ---------------------------------------------------------
@@ -127,23 +142,12 @@ class OutputBuffer:
         if self.spilled_path:
             return (
                 f"Output exceeded {self.max_size} bytes; "
-                f"full output saved to {self.spilled_path}"
+                f"captured output saved to {self.spilled_path}"
             )
         return f"Output exceeded {self.max_size} bytes"
 
     # -- lifecycle ---------------------------------------------------------
 
     def close(self) -> None:
-        if self._spill is not None:
-            try:
-                self._spill.close()
-            finally:
-                self._spill = None
-
-    def __del__(self) -> None:
-        # Best-effort: the spill file itself is a deliverable and stays on
-        # disk, but the descriptor must not outlive the buffer.
-        try:
-            self.close()
-        except Exception:
-            pass
+        """No-op kept for API compatibility - this buffer holds no handle."""
+        self._pending.clear()
