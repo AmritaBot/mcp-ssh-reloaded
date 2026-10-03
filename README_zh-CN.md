@@ -226,6 +226,35 @@ svc = SSHService(config=ServerConfig(default_timeout=60, max_timeout=600))
 - **提示符检测**：通过捕获的提示符或空闲超时（2 秒）判断命令完成
 - **会话恢复**：多次提示符检测失败后自动 Ctrl+C 重置卡住的 Shell
 
+## 测试
+
+```bash
+# 只跑单元测试 - 没有 SSH_TEST_HOST 时集成测试会自动跳过
+uv run pytest tests/
+
+# 跑全部，针对一台真实主机
+SSH_TEST_HOST=myserver SSH_TEST_USER=admin SSH_TEST_PASSWORD=secret uv run pytest tests/
+
+# 或者起一个一次性的 sshd 容器（与 CI 使用的是同一个镜像）
+docker build -t mcp-ssh-test .github/sshd-test
+docker run -d --name sshd-test -p 127.0.0.1:2222:22 mcp-ssh-test
+SSH_TEST_HOST=127.0.0.1 SSH_TEST_PORT=2222 SSH_TEST_USER=root \
+SSH_TEST_PASSWORD=rootpass SSH_TEST_SUDO_PASSWORD=rootpass \
+uv run pytest tests/ --ignore=tests/test_mikrotik.py --ignore=tests/test_network_devices.py
+```
+
+`test_mikrotik.py` 与 `test_network_devices.py` 需要真实网络设备。
+
+`.github/workflows/integration.yml` 会在每个 PR 上跑容器版集成测试；
+`.github/workflows/ci.yml` 负责单元测试、pyright、ruff 与打包，覆盖 Python 3.10-3.13。
+
+## 架构
+
+类型集中声明在单一模块（`models.py`），`api_types.py` 与 `datastructures.py`
+退化为向后兼容的 re-export 壳。所有执行都走同一条栈 `CommandExecutor`，
+返回结构化的 `ExecutionResult`。模块图、执行流水线与已知遗留见
+[docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)。
+
 ## 文档
 
 | 文档                                                       | 主题                                                      |
@@ -236,6 +265,8 @@ svc = SSHService(config=ServerConfig(default_timeout=60, max_timeout=600))
 | [docs/INTERACTIVE_MODE.md](./docs/INTERACTIVE_MODE.md)     | 终端仿真、屏幕快照、按键发送                              |
 | [docs/SAFETY_PROTECTIONS.md](./docs/SAFETY_PROTECTIONS.md) | 限制、超时、会话恢复、错误处理                            |
 | [docs/DOCKER.md](./docs/DOCKER.md)                         | Docker 运行指南                                           |
+| [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)             | 模块图、执行流水线、已知遗留                              |
+
 
 ## License
 

@@ -226,6 +226,37 @@ Commands run inside persistent interactive shells:
 - **Prompt detection**: completion detected via captured prompt or idle timeout (2 s)
 - **Session recovery**: stuck shells auto-reset after repeated prompt-detection failures
 
+## Testing
+
+```bash
+# unit tests only - the integration suites self-skip without SSH_TEST_HOST
+uv run pytest tests/
+
+# everything, against a real host
+SSH_TEST_HOST=myserver SSH_TEST_USER=admin SSH_TEST_PASSWORD=secret uv run pytest tests/
+
+# or spin up a throw-away sshd container (the same image CI uses)
+docker build -t mcp-ssh-test .github/sshd-test
+docker run -d --name sshd-test -p 127.0.0.1:2222:22 mcp-ssh-test
+SSH_TEST_HOST=127.0.0.1 SSH_TEST_PORT=2222 SSH_TEST_USER=root \
+SSH_TEST_PASSWORD=rootpass SSH_TEST_SUDO_PASSWORD=rootpass \
+uv run pytest tests/ --ignore=tests/test_mikrotik.py --ignore=tests/test_network_devices.py
+```
+
+`test_mikrotik.py` and `test_network_devices.py` need physical network gear.
+
+`.github/workflows/integration.yml` runs the container-backed suite on every
+pull request; `.github/workflows/ci.yml` covers unit tests, pyright, ruff and
+packaging across Python 3.10-3.13.
+
+## Architecture
+
+Types are declared in a single module (`models.py`); `api_types.py` and
+`datastructures.py` are backward-compatible re-export shims. All execution goes
+through one stack, `CommandExecutor`, which returns a structured
+`ExecutionResult`. See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for the
+module map, the execution pipeline and the known gaps.
+
 ## Docs
 
 | Doc                                                        | Topic                                                                  |
@@ -236,6 +267,8 @@ Commands run inside persistent interactive shells:
 | [docs/INTERACTIVE_MODE.md](./docs/INTERACTIVE_MODE.md)     | Terminal emulation, screen snapshots, key sending                      |
 | [docs/SAFETY_PROTECTIONS.md](./docs/SAFETY_PROTECTIONS.md) | Limits, timeouts, session recovery, error handling                     |
 | [docs/DOCKER.md](./docs/DOCKER.md)                         | Running via Docker                                                     |
+| [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)             | Module map, execution pipeline, known gaps                             |
+
 
 ## License
 

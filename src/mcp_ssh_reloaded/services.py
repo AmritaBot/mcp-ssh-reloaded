@@ -60,7 +60,7 @@ class SSHService:
         """Execute a command and wait for completion."""
         t0 = _now_ms()
         try:
-            stdout, stderr, exit_code = await self._engine.execute_command(
+            result = await self._engine.execute_result(
                 host=conn.host,
                 username=conn.username,
                 command=command,
@@ -72,28 +72,27 @@ class SSHService:
                 sudo_password=conn.sudo_password if sudo else None,
                 timeout=timeout or self.config.default_timeout,
             )
-            # Handle async transition
-            if exit_code == 124 and stderr.startswith("ASYNC:"):
+            # No string parsing: the executor already told us what happened.
+            if result.status is CommandStatus.RUNNING:
                 return CommandResult(
-                    stdout=stdout,
-                    stderr=stderr,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
                     exit_code=0,
                     status=CommandStatus.RUNNING,
-                    command_id=stderr.split(":", 2)[1],
+                    command_id=result.command_id,
                 )
-            if exit_code == 124 and stderr.startswith("AWAITING_INPUT:"):
-                parts = stderr.split(":", 2)
+            if result.status is CommandStatus.AWAITING_INPUT:
                 return CommandResult(
-                    stdout=stdout,
-                    stderr=stderr,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
                     exit_code=0,
                     status=CommandStatus.AWAITING_INPUT,
-                    command_id=parts[1],
+                    command_id=result.command_id,
                 )
             return CommandResult(
-                stdout=stdout,
-                stderr=stderr,
-                exit_code=exit_code,
+                stdout=result.stdout,
+                stderr=result.stderr,
+                exit_code=result.exit_code or 0,
                 duration_ms=_now_ms() - t0,
             )
         except ConnectionError as e:

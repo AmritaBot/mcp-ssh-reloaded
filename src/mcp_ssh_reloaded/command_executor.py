@@ -20,8 +20,58 @@ from mcp_ssh_reloaded.api_types import ServerConfig
 if TYPE_CHECKING:
     from mcp_ssh_reloaded.session_manager import SSHSessionManager
 
-from .datastructures import CommandStatus, RunningCommand
+from .models import CommandStatus, ExecutionResult, RunningCommand
 from .validation import OutputLimiter
+
+
+def _result_from_legacy(
+    stdout: str,
+    stderr: str,
+    exit_code: int,
+    awaiting_input: str | None = None,
+    sentinel: str | None = None,
+) -> ExecutionResult:
+    """The single place that interprets the legacy exit-code conventions.
+
+    The low-level executors still report ``124`` for "still running" and encode
+    the awaiting-input reason as a ``"Command requires input: "`` stderr prefix.
+    This adapter turns that into a structured :class:`ExecutionResult`, so no
+    caller downstream has to look at magic numbers or string prefixes.
+    """
+    if awaiting_input is None and stderr.startswith("Command requires input: "):
+        awaiting_input = stderr[len("Command requires input: ") :]
+    if awaiting_input:
+        return ExecutionResult(
+            status=CommandStatus.AWAITING_INPUT,
+            stdout=stdout,
+            stderr=stderr,
+            awaiting_input=awaiting_input,
+            sentinel=sentinel,
+        )
+    if exit_code == 124:
+        return ExecutionResult(
+            status=CommandStatus.RUNNING,
+            stdout=stdout,
+            stderr=stderr,
+            sentinel=sentinel,
+        )
+    return ExecutionResult(
+        status=CommandStatus.COMPLETED,
+        stdout=stdout,
+        stderr=stderr,
+        exit_code=exit_code,
+        sentinel=sentinel,
+    )
+
+
+def _render_legacy(result: ExecutionResult) -> tuple[str, str, int]:
+    """Render an :class:`ExecutionResult` in the legacy ``(stdout, stderr, code)`` form."""
+    if result.status is CommandStatus.RUNNING:
+        suffix = ":long_running" if result.long_running else ""
+        return result.stdout, f"ASYNC:{result.command_id}{suffix}", 124
+    if result.status is CommandStatus.AWAITING_INPUT:
+        return "", f"AWAITING_INPUT:{result.command_id}:{result.awaiting_input}", 124
+    return result.stdout, result.stderr, result.exit_code or 0
 
 
 class CommandExecutor:
@@ -44,6 +94,11 @@ class CommandExecutor:
 
         # Mark when the interpreter is shutting down so we can skip late submissions
         atexit.register(self._mark_interpreter_exit)
+
+    @property
+    def _sm(self) -> SSHSessionManager:
+        """The owning session manager (shared session state lives here)."""
+        return self._session_manager
 
     # Package manager commands that need special handling
     PACKAGE_MANAGER_PATTERNS: ClassVar[list[str]] = [
@@ -71,7 +126,7 @@ class CommandExecutor:
     def _mark_interpreter_exit(self):
         self._interpreter_exiting = True
 
-    async def execute_command(
+    async def execute_result(
         self,
         host: str,
         username: str | None = None,
@@ -83,9 +138,9 @@ class CommandExecutor:
         enable_command: str = "enable",
         sudo_password: str | None = None,
         timeout: int = 30,
-    ) -> tuple[str, str, int]:
-        """Execute a command on a host using persistent session."""
-        logger = self.logger.getChild("execute_command")
+    ) -> ExecutionResult:
+        """Primary entry point: run a command and return a structured result."""
+        logger = self.logger.getChild("execute_result")
         logger.info(
             f"[EXEC_REQ] host={host}, cmd={command[:100]}..., timeout={timeout}"
         )
@@ -100,21 +155,28 @@ class CommandExecutor:
         )
         if not is_valid:
             logger.warning(f"[EXEC_INVALID] {error_msg}")
-            return "", error_msg or "Invalid command", 1
+            return ExecutionResult(
+                status=CommandStatus.FAILED,
+                stderr=error_msg or "Invalid command",
+                exit_code=1,
+            )
 
         # Check for interactive wizard commands that will hang
         if self._is_interactive_wizard(command):
             logger.warning(
                 f"[EXEC_WIZARD] Detected interactive wizard command: {command}"
             )
-            return (
-                "",
-                f"Command '{command}' appears to spawn an interactive wizard that requires user interaction. "
-                "Interactive wizards cannot be run via SSH session. "
-                "Consider using non-interactive alternatives:\n"
-                "- For fish_config: Use 'fish -c \"set -U fish_color_* ...\"' to set colors directly\n"
-                "- For package managers: Use with -y/--yes flags to avoid prompts",
-                1,
+            return ExecutionResult(
+                status=CommandStatus.FAILED,
+                stderr=(
+                    f"Command '{command}' appears to spawn an interactive wizard "
+                    "that requires user interaction. Interactive wizards cannot be "
+                    "run via SSH session. Consider using non-interactive "
+                    "alternatives:\n"
+                    "- For fish_config: Use 'fish -c \"set -U fish_color_* ...\"' to set colors directly\n"
+                    "- For package managers: Use with -y/--yes flags to avoid prompts"
+                ),
+                exit_code=1,
             )
 
         # Start async
@@ -133,57 +195,108 @@ class CommandExecutor:
                 timeout,
             )
         except Exception as e:
-            return "", str(e), 1
+            return ExecutionResult(
+                status=CommandStatus.FAILED, stderr=str(e), exit_code=1
+            )
 
-        # Package manager installs/upgrades commonly exceed MCP client-side call timeouts.
-        # Start these in async mode immediately and let callers poll for completion.
+        # Package manager installs/upgrades commonly exceed MCP client-side call
+        # timeouts, so they are handed straight back for the caller to poll.
         if self._should_start_async_immediately(command):
             logger.info(f"[EXEC_ASYNC_IMMEDIATE] command_id={command_id}")
-            return "", f"ASYNC:{command_id}:long_running", 124
+            return ExecutionResult(
+                status=CommandStatus.RUNNING,
+                command_id=command_id,
+                long_running=True,
+            )
 
         logger.debug(f"[EXEC_ASYNC_ID] command_id={command_id}")
 
         # Poll until done or timeout
         start = time.time()
         poll_count = 0
-        getattr(self._session_manager, "SYNC_IDLE_TO_ASYNC", 0)
         while time.time() - start < timeout:
             status = self.get_command_status(command_id)
             poll_count += 1
 
             if "error" in status:
                 logger.error(f"[EXEC_ERROR] {status['error']}")
-                return "", status["error"], 1
+                return ExecutionResult(
+                    status=CommandStatus.FAILED,
+                    command_id=command_id,
+                    stderr=status["error"],
+                    exit_code=1,
+                )
 
             if status["status"] == "awaiting_input":
                 reason = status.get("awaiting_input_reason", "unknown")
                 logger.info(
                     f"[EXEC_AWAIT] Command {command_id} waiting for input: {reason}"
                 )
-                # Return immediately for awaiting input, let the tool handle it.
-                return "", f"AWAITING_INPUT:{command_id}:{reason}", 124
+                return ExecutionResult(
+                    status=CommandStatus.AWAITING_INPUT,
+                    command_id=command_id,
+                    stdout=status.get("stdout", ""),
+                    awaiting_input=reason,
+                )
 
             if status["status"] != "running":
                 logger.info(
-                    f"[EXEC_DONE] status={status['status']}, polls={poll_count}, duration={time.time() - start:.2f}s"
+                    f"[EXEC_DONE] status={status['status']}, polls={poll_count}, "
+                    f"duration={time.time() - start:.2f}s"
                 )
-                return status["stdout"], status["stderr"], status["exit_code"] or 0
-
-            # If the command is running but has been idle for SYNC_IDLE_TO_ASYNC, it means it *should* transition to async
-            # and we should continue polling until the full timeout for this sync execute_command call.
-            # The `_execute_standard_command_internal` function will return `ASYNC:{command_id}` if it hits its idle timeout.
-            # The outer `execute_command` (sync tool) should then continue to poll this async ID.
-            # This block is for when the *internal* async transition happens, but the outer sync call should keep waiting.
-            # If we reached here, it means the internal worker is still 'running' but might be idle or waiting internally.
+                return ExecutionResult(
+                    status=CommandStatus.COMPLETED,
+                    command_id=command_id,
+                    stdout=status["stdout"],
+                    stderr=status["stderr"],
+                    exit_code=status["exit_code"] or 0,
+                )
 
             await asyncio.sleep(0.1)
 
-        # If we reach here, the command genuinely timed out based on the outer `timeout` parameter.
+        # The command outlived this call's timeout; the executor keeps it alive
+        # in background monitoring, so report it as still running.
         logger.warning(
             f"[EXEC_TIMEOUT] Command {command_id} timed out after {timeout}s"
         )
         status_on_timeout = self.get_command_status(command_id)
-        return status_on_timeout.get("stdout", ""), f"ASYNC:{command_id}", 124
+        return ExecutionResult(
+            status=CommandStatus.RUNNING,
+            command_id=command_id,
+            stdout=status_on_timeout.get("stdout", ""),
+        )
+
+    async def execute_command(
+        self,
+        host: str,
+        username: str | None = None,
+        command: str = "",
+        password: str | None = None,
+        key_filename: str | None = None,
+        port: int | None = None,
+        enable_password: str | None = None,
+        enable_command: str = "enable",
+        sudo_password: str | None = None,
+        timeout: int = 30,
+    ) -> tuple[str, str, int]:
+        """Legacy tuple API, rendered from :meth:`execute_result`.
+
+        Kept so the MCP text output and older callers are unchanged.
+        """
+        return _render_legacy(
+            await self.execute_result(
+                host,
+                username,
+                command,
+                password,
+                key_filename,
+                port,
+                enable_password,
+                enable_command,
+                sudo_password,
+                timeout,
+            )
+        )
 
     @staticmethod
     def _should_start_async_immediately(command: str) -> bool:
@@ -215,8 +328,16 @@ class CommandExecutor:
         enable_password: str | None = None,
         enable_command: str = "enable",
         timeout: int | None = None,
+        auto_extend_timeout: bool = False,
+        max_timeout: int = 300,
+        streaming_mode: bool = False,
+        progress_callback: str | None = None,
     ) -> str:
-        """Execute a command asynchronously without blocking."""
+        """Execute a command asynchronously without blocking.
+
+        The trailing keyword options are the former EnhancedCommandExecutor
+        features, now expressed as options on the one execution stack.
+        """
         if timeout is None:
             timeout = self.config.async_default_timeout
         logger = self.logger.getChild("execute_async")
@@ -249,6 +370,10 @@ class CommandExecutor:
             exit_code=None,
             start_time=datetime.now(),
             end_time=None,
+            auto_extend_timeout=auto_extend_timeout,
+            max_timeout=max_timeout,
+            streaming_mode=streaming_mode,
+            progress_callback=progress_callback,
         )
 
         stuck_shells = []
@@ -354,53 +479,58 @@ class CommandExecutor:
                 stdout, stderr, exit_code = self._execute_sudo_command_internal(
                     client, command, sudo_password, timeout
                 )
-                # Parse awaiting_input from stderr if present
-                if exit_code == 1 and stderr.startswith("Command requires input: "):
-                    awaiting_input_reason = stderr.replace(
-                        "Command requires input: ", ""
-                    )
-                else:
-                    awaiting_input_reason = None
+                result = _result_from_legacy(stdout, stderr, exit_code)
             elif enable_password:
                 logger.debug(f"Executing in enable mode for {command_id}")
-                stdout, stderr, exit_code = self._execute_enable_mode_command_internal(
-                    client,
-                    session_key,
-                    command,
-                    enable_password,
-                    enable_command,
-                    timeout,
+                stdout, stderr, exit_code = asyncio.run(
+                    self._execute_enable_mode_command_internal(
+                        client,
+                        session_key,
+                        command,
+                        enable_password,
+                        enable_command,
+                        timeout,
+                    )
                 )
-                awaiting_input_reason = None
+                result = _result_from_legacy(stdout, stderr, exit_code)
             else:
                 logger.debug(f"Executing as standard command for {command_id}")
-                stdout, stderr, exit_code, awaiting_input_reason, sentinel = (
-                    self._execute_standard_command_internal(
-                        client, command, timeout, session_key
-                    )
+                (
+                    stdout,
+                    stderr,
+                    exit_code,
+                    awaiting_input_reason,
+                    sentinel,
+                ) = self._execute_standard_command_internal(
+                    client, command, timeout, session_key
+                )
+                result = _result_from_legacy(
+                    stdout, stderr, exit_code, awaiting_input_reason, sentinel
                 )
                 with self._lock:
                     if command_id in self._commands:
-                        running_cmd.sentinel = sentinel
+                        running_cmd.sentinel = result.sentinel
 
             logger.debug(
-                f"[WORKER_DONE] command_id={command_id}, exit_code={exit_code}, awaiting_input={awaiting_input_reason}"
+                f"[WORKER_DONE] command_id={command_id}, "
+                f"status={result.status.value}, exit_code={result.exit_code}, "
+                f"awaiting_input={result.awaiting_input}"
             )
 
             # Handle timeout case - command is still running on remote shell
-            if exit_code == 124 and not awaiting_input_reason:
+            if result.status is CommandStatus.RUNNING:
                 logger.warning(
                     f"Command {command_id} timed out after {timeout}s, continuing to monitor in background"
                 )
                 with self._lock:
                     if command_id in self._commands:
-                        running_cmd.stdout = stdout
+                        running_cmd.stdout = result.stdout
                         # Preserve existing stderr if it has useful info (like Output limit exceeded)
                         timeout_msg = (
                             f"Command exceeded {timeout}s timeout, still running..."
                         )
-                        if stderr and stderr != "Timed out":
-                            running_cmd.stderr = f"{stderr}\n{timeout_msg}"
+                        if result.stderr and result.stderr != "Timed out":
+                            running_cmd.stderr = f"{result.stderr}\n{timeout_msg}"
                         else:
                             running_cmd.stderr = timeout_msg
                         running_cmd.exit_code = (
@@ -438,14 +568,14 @@ class CommandExecutor:
             # Normal completion or awaiting input
             with self._lock:
                 if command_id in self._commands:
-                    running_cmd.stdout = stdout
-                    running_cmd.stderr = stderr
-                    running_cmd.exit_code = exit_code
-                    running_cmd.awaiting_input_reason = awaiting_input_reason
-                    if awaiting_input_reason:
+                    running_cmd.stdout = result.stdout
+                    running_cmd.stderr = result.stderr
+                    running_cmd.exit_code = result.exit_code
+                    running_cmd.awaiting_input_reason = result.awaiting_input
+                    if result.status is CommandStatus.AWAITING_INPUT:
                         running_cmd.status = CommandStatus.AWAITING_INPUT
                         logger.info(
-                            f"Command {command_id} awaiting input: {awaiting_input_reason}"
+                            f"Command {command_id} awaiting input: {result.awaiting_input}"
                         )
                     else:
                         running_cmd.status = CommandStatus.COMPLETED
@@ -1346,13 +1476,9 @@ class CommandExecutor:
 
             self._commands.clear()
 
-    def _execute_standard_command_internal(
-        self, client: paramiko.SSHClient, command: str, timeout: int, session_key: str
-    ) -> tuple[str, str, int, str | None, str | None]:
-        """Internal method to execute a standard SSH command using persistent shell."""
-        return self._session_manager._execute_standard_command_internal(
-            client, command, timeout, session_key
-        )
+    # ------------------------------------------------------------------
+    # Execution internals (moved out of SSHSessionManager)
+    # ------------------------------------------------------------------
 
     def _execute_sudo_command_internal(
         self,
@@ -1361,12 +1487,674 @@ class CommandExecutor:
         sudo_password: str,
         timeout: int = 30,
     ) -> tuple[str, str, int]:
-        """Internal method to execute a command with sudo, handling password prompt."""
-        return self._session_manager._execute_sudo_command_internal(
-            client, command, sudo_password, timeout
-        )
+        """Execute a sudo command using the persistent shell, handling password prompts.
 
-    def _execute_enable_mode_command_internal(
+        Uses the persistent shell from the session to maintain state and benefit from
+        prompt detection.
+        """
+        logger = self._sm.logger.getChild("sudo_command")
+
+        # Get session key for this client
+        # We need to derive the session key from the client
+        # Find the session key that matches this client
+        session_key = None
+        with self._sm._lock:
+            for key, sess_client in self._sm._sessions.items():
+                if sess_client == client:
+                    session_key = key
+                    break
+
+        if not session_key:
+            logger.error("Could not find session key for client")
+            return "", "Could not find session for sudo command", 1
+
+        try:
+            timeout = min(timeout, self._sm.MAX_COMMAND_TIMEOUT)
+
+            # Ensure command starts with sudo
+            if not command.strip().startswith("sudo"):
+                command = f"sudo {command}"
+
+            # Get the persistent shell
+            shell = self._sm._get_or_create_shell(session_key, client)
+            shell.settimeout(timeout)
+
+            # Send the command
+            shell.send((command + "\n").encode("utf-8"))
+            time.sleep(0.5)
+
+            output_limiter = OutputLimiter()
+            raw_output = ""
+            password_sent = False
+            start_time = time.time()
+            last_recv_time = start_time
+            idle_timeout = 2.0
+            max_idle_checks = 50  # Max 5 seconds of idle checking (50 * 0.1s)
+            idle_check_count = 0
+
+            while time.time() - start_time < timeout:
+                if shell.recv_ready():
+                    chunk = shell.recv(4096).decode("utf-8", errors="ignore")
+                    logger.debug(f"Received chunk: {chunk!r}")
+                    self._sm._feed_emulator(session_key, chunk)
+                    last_recv_time = time.time()
+                    idle_check_count = 0  # Reset idle check counter on new data
+                    limited_chunk, should_continue = output_limiter.add_chunk(chunk)
+                    raw_output += limited_chunk
+
+                    # Check for password prompt
+                    if not password_sent and re.search(
+                        r"\[sudo\] password|password for", raw_output, re.IGNORECASE
+                    ):
+                        logger.debug("Detected sudo password prompt, sending password")
+                        shell.send(f"{sudo_password}\n".encode())
+                        password_sent = True
+                        time.sleep(0.3)
+                        # Clear output buffer to avoid re-detecting the prompt
+                        raw_output = ""
+                        continue
+
+                    if not should_continue:
+                        return (
+                            raw_output,
+                            f"Output truncated at {output_limiter.max_size} bytes",
+                            124,
+                        )
+
+                    # Check for interactive prompts (SSH host key, etc.) BEFORE checking completion
+                    awaiting = self._sm._detect_awaiting_input(raw_output, session_key)
+                    if awaiting:
+                        logger.info(f"Sudo command waiting for input: {awaiting}")
+                        return raw_output, f"Command requires input: {awaiting}", 1
+
+                    # Check for command completion using prompt detection
+                    clean_output = self._sm._strip_ansi(raw_output)
+                    is_complete, cleaned_output = self._sm._check_prompt_completion(
+                        session_key, raw_output, clean_output
+                    )
+
+                    if is_complete:
+                        logger.debug("Sudo command completed (prompt detected)")
+                        return cleaned_output, "", 0
+                else:
+                    # Check idle timeout
+                    if raw_output and (time.time() - last_recv_time) > idle_timeout:
+                        idle_check_count += 1
+
+                        # If we've been idle-checking too long without finding a prompt, break
+                        if idle_check_count > max_idle_checks:
+                            logger.warning(
+                                f"Sudo command exceeded max idle checks ({max_idle_checks}), assuming still running"
+                            )
+                            break
+
+                        # Check for interactive prompts during idle
+                        awaiting = self._sm._detect_awaiting_input(raw_output, session_key)
+                        if awaiting:
+                            logger.info(
+                                f"Sudo command waiting for input (idle): {awaiting}"
+                            )
+                            return raw_output, f"Command requires input: {awaiting}", 1
+
+                        logger.debug("Sudo command idle timeout, checking completion")
+                        clean_output = self._sm._strip_ansi(raw_output)
+                        is_complete, cleaned_output = self._sm._check_prompt_completion(
+                            session_key, raw_output, clean_output
+                        )
+                        if is_complete:
+                            logger.debug("Sudo command completed (idle timeout)")
+                            return cleaned_output, "", 0
+                        # If not complete but idle, wait a bit more
+
+                    time.sleep(0.1)
+
+            # Timeout reached
+            logger.warning(f"Sudo command timed out after {timeout}s")
+            return raw_output.strip(), f"Command timed out after {timeout} seconds", 124
+
+        except paramiko.SSHException as exc:
+            logger.error(f"SSH error during sudo command: {exc}")
+            return "", f"SSH error: {exc}", 1
+        except Exception as exc:
+            logger.logger.error(f"Error executing sudo command: {exc}", exc_info=True)
+            return "", f"Error executing sudo command: {exc}", 1
+
+
+    def _execute_standard_command_internal(
+        self, client: paramiko.SSHClient, command: str, timeout: int, session_key: str
+    ) -> tuple[str, str, int, str | None, str | None]:
+        """Execute command with natural completion detection and interactive prompt detection.
+
+        Returns: (stdout, stderr, exit_code, awaiting_input_reason, sentinel)
+        - awaiting_input_reason is None if complete, or a string describing what input is needed
+        - sentinel is the marker string used for Unix completion, or None
+        """
+        logger = self._sm.logger.getChild("standard_command")
+        command = self._sm._maybe_rewrite_mikrotik_command(session_key, command)
+
+        # Check if this command will change the shell context
+        context_changing = self._sm._is_context_changing_command(command)
+        if context_changing:
+            logger.info(f"Detected context-changing command: {command}")
+
+        sentinel: str | None = None
+        try:
+            shell = self._sm._get_or_create_shell(session_key, client)
+            shell.settimeout(timeout)
+
+            with self._sm._lock:
+                self._sm._active_commands[session_key] = shell
+
+            # Clear any pending output to avoid matching stale prompts
+            if shell.recv_ready():
+                try:
+                    while shell.recv_ready():
+                        shell.recv(4096)
+                except Exception:
+                    pass
+
+            # Check shell type to decide on sentinel usage
+            shell_type = self._sm._session_shell_types.get(session_key, "unknown")
+            logger.debug(f"Shell type for {session_key}: {shell_type}")
+            is_unix = shell_type == "unix_shell"
+
+            # Use sentinel only for Unix-like shells and non-interactive commands
+            sentinel = None
+            command_to_send = command
+            # Skip sentinel if command appears to read from stdin (like 'read' command)
+            is_interactive_cmd = re.search(r"\bread\b", command)
+            if is_unix and not is_interactive_cmd:
+                marker = f"__MCP_CMD_{uuid.uuid4().hex[:8]}__"
+                command_to_send = self._sm._build_command_with_sentinel(command, marker, "")
+                sentinel = marker
+                logger.debug(f"Using sentinel marker: {sentinel}")
+
+            logger.info(f"Executing command on {session_key}: {command}")
+            shell.send((command_to_send + "\n").encode("utf-8"))
+            time.sleep(0.3)
+
+            output_limiter = OutputLimiter()
+            raw_output = ""
+            start_time = time.time()
+            last_recv_time = start_time
+
+            # Package managers need longer idle timeout due to database operations
+            command_lower = command.lower().strip()
+            is_package_manager = any(
+                [
+                    re.search(
+                        r"\bpkg\s+(install|upgrade|update|remove|delete)", command_lower
+                    ),
+                    re.search(
+                        r"\bapt(?:-get)?\s+(install|upgrade|update|dist-upgrade|full-upgrade|remove|purge)",
+                        command_lower,
+                    ),
+                    re.search(
+                        r"\b(dnf|yum|zypper)\s+(install|upgrade|update|remove|erase)",
+                        command_lower,
+                    ),
+                    re.search(
+                        r"\bpacman\s+(-[SsRr]\b|--sync\b|--remove\b|install|upgrade|update|remove)",
+                        command_lower,
+                    ),
+                    re.search(
+                        r"\bapk\s+(add|install|upgrade|update|del|delete)",
+                        command_lower,
+                    ),
+                    re.search(
+                        r"\bbrew\s+(install|upgrade|update|uninstall|remove)",
+                        command_lower,
+                    ),
+                ]
+            )
+            # Use 10 second idle timeout for package managers, 2 seconds for others
+            idle_timeout = (
+                self._sm.config.package_manager_idle_timeout
+                if is_package_manager
+                else self._sm.config.normal_idle_timeout
+            )
+            if is_package_manager:
+                logger.info(
+                    f"Detected package manager command, using extended idle timeout of {idle_timeout}s"
+                )
+
+            seen_command_echo = False
+            echo_end_pos: int | None = None
+            # Ensure prompt pattern exists as fallback
+            self._sm._ensure_prompt_pattern(session_key, client, shell=shell)
+            consecutive_misses = 0  # Track consecutive prompt detection failures
+
+            output_limiter = OutputLimiter()
+            raw_output_chunks = []
+
+            while time.time() - start_time < timeout:
+                if shell.recv_ready():
+                    chunk = shell.recv(4096).decode("utf-8", errors="ignore")
+                    logger.debug(f"Received chunk: {chunk!r}")
+                    self._sm._feed_emulator(session_key, chunk)
+                    last_recv_time = time.time()
+                    limited_chunk, should_continue = output_limiter.add_chunk(chunk)
+                    raw_output_chunks.append(limited_chunk)
+
+                    # Optimization: We primarily check for prompts/input on small chunks
+                    # or after data accumulation.
+                    should_check = False
+                    if len(chunk) < 100:  # Small chunks often contain prompts
+                        stripped_chunk = self._sm._strip_ansi(chunk)
+                        if (
+                            stripped_chunk
+                            and stripped_chunk.strip()
+                            and stripped_chunk.strip()[-1]
+                            in ("$", "#", ">", "%", ":", "?")
+                        ):
+                            should_check = True
+
+                    if not should_check and (len(raw_output_chunks) % 20 == 0):
+                        should_check = True
+
+                    # ALWAYS update raw_output if we need to check echo, limit, or sentinel
+                    # to ensure we don't use stale data.
+                    if should_check or not seen_command_echo or sentinel:
+                        raw_output = "".join(raw_output_chunks)
+
+                    if not seen_command_echo and "\n" in raw_output:
+                        seen_command_echo = True
+                        # Record end of echo line so prompt detection only looks after it
+                        clean_snapshot = self._sm._strip_ansi(raw_output)
+                        newline_idx = clean_snapshot.find("\n")
+                        if newline_idx != -1:
+                            echo_end_pos = newline_idx + 1
+
+                    if not should_continue:
+                        logger.warning("Output limit reached")
+                        return (
+                            "".join(raw_output_chunks),
+                            "Output limit exceeded",
+                            124,
+                            None,
+                            sentinel,
+                        )
+
+                    if should_check:
+                        # Check for interactive prompts BEFORE checking for completion
+                        awaiting = self._sm._detect_awaiting_input(raw_output, session_key)
+                        if awaiting:
+                            # Only treat as awaiting input after a brief idle and if prompt isn't present
+                            # Exception: Pagers should be handled immediately to keep stream flowing
+                            if (
+                                awaiting == "pager"
+                                or (time.time() - last_recv_time) > 0.2
+                            ):
+                                clean_output = self._sm._strip_ansi(raw_output)
+                                tail_start = echo_end_pos or 0
+                                tail_clean = clean_output[tail_start:]
+                                is_complete, _ = self._sm._check_prompt_completion(
+                                    session_key, raw_output, tail_clean
+                                )
+                                if not is_complete:
+                                    logger.info(
+                                        f"Detected interactive prompt: {awaiting}"
+                                    )
+                                    # Automatically handle pagers by sending 'q' to quit
+                                    if awaiting == "pager":
+                                        logger.info(
+                                            "Automatically handling pager - sending 'q' to quit"
+                                        )
+
+                                        # Strip MikroTik pager prompt from output to avoid agent confusion
+                                        # Match raw output as detection does
+                                        raw_output = re.sub(
+                                            r"--\s*\[Q quit\|D dump\|.*?\]\s*$",
+                                            "",
+                                            raw_output,
+                                        )
+                                        # Update chunks
+                                        raw_output_chunks = [raw_output]
+
+                                        shell.send(b"q")
+                                        # Wait for pager to exit and shell prompt to appear
+                                        # Don't just continue - actively wait for the prompt
+                                        pager_exit_start = time.time()
+                                        pager_exit_timeout = 3.0
+                                        while (
+                                            time.time() - pager_exit_start
+                                            < pager_exit_timeout
+                                        ):
+                                            time.sleep(0.1)
+                                            if shell.recv_ready():
+                                                chunk = shell.recv(4096).decode(
+                                                    "utf-8", errors="ignore"
+                                                )
+                                                logger.debug(
+                                                    f"Received chunk (pager): {chunk!r}"
+                                                )
+                                                self._sm._feed_emulator(session_key, chunk)
+                                                limited_chunk, should_continue = (
+                                                    output_limiter.add_chunk(chunk)
+                                                )
+                                                raw_output_chunks.append(limited_chunk)
+                                                raw_output = "".join(raw_output_chunks)
+                                                if not should_continue:
+                                                    return (
+                                                        raw_output,
+                                                        "Output limit exceeded",
+                                                        124,
+                                                        None,
+                                                        sentinel,
+                                                    )
+                                                # Check if we now have the shell prompt
+                                                clean_output = self._sm._strip_ansi(
+                                                    raw_output
+                                                )
+                                                tail_start = echo_end_pos or 0
+                                                tail_clean = clean_output[tail_start:]
+                                                is_complete, cleaned_output = (
+                                                    self._sm._check_prompt_completion(
+                                                        session_key,
+                                                        raw_output,
+                                                        tail_clean,
+                                                    )
+                                                )
+                                                if is_complete:
+                                                    logger.debug(
+                                                        "Shell prompt detected after quitting pager"
+                                                    )
+                                                    return (
+                                                        cleaned_output,
+                                                        "",
+                                                        0,
+                                                        None,
+                                                        sentinel,
+                                                    )
+
+                                # For other types of input (password, etc.), return and let agent handle
+                                return (
+                                    self._sm._strip_sentinel(raw_output, sentinel),
+                                    "",
+                                    0,
+                                    awaiting,
+                                    sentinel,
+                                )
+
+                    # Check for sentinel (Unix shells)
+                    if sentinel and sentinel in raw_output:
+                        logger.debug("Sentinel detected")
+                        # Extract exit code and clean output
+                        clean_output = self._sm._strip_ansi(raw_output)
+
+                        # Find sentinel and exit code
+                        # Pattern: marker + digits
+                        sentinel_pattern = re.compile(re.escape(sentinel) + r"(\d+)")
+                        match = sentinel_pattern.search(clean_output)
+                        if match:
+                            exit_code = int(match.group(1))
+
+                            # Clean up output: remove everything from sentinel onwards using the match position
+                            # This avoids truncating at the command echo which also contains the sentinel string
+
+                            # We use clean_output for truncation to ensure accurate regex index matching
+                            # match.start() is the index of the sentinel in clean_output
+                            final_output = clean_output[: match.start()]
+
+                            # We should return the clean output directly
+                            return final_output.strip(), "", exit_code, None, sentinel
+
+                    # Check for command completion using captured prompt or pattern
+                    # Only check after brief idle to avoid false positives from command echo
+                    # AND make sure we've seen the command echo (newline)
+                    if seen_command_echo and (time.time() - last_recv_time) > 0.2:
+                        clean_output = self._sm._strip_ansi(raw_output)
+                        tail_start = echo_end_pos or 0
+                        tail_clean = clean_output[tail_start:]
+
+                        is_complete, cleaned_output = self._sm._check_prompt_completion(
+                            session_key, raw_output, tail_clean
+                        )
+
+                        # If sentinel mode is on, we ignore simple prompt matching unless
+                        # we are really sure or it's been a long time?
+                        # Actually, the bug is "Cost is 10$" triggers prompt match.
+                        # If we have a sentinel, "Cost is 10$" will appear, but sentinel won't.
+                        # So we should IGNORE is_complete if sentinel is active and sentinel not found.
+                        if sentinel and is_complete:
+                            # Logic: If sentinel is used, we trust sentinel.
+                            # We DO NOT return on prompt detection alone to fix the bug.
+                            is_complete = False
+                    else:
+                        is_complete = False
+                        cleaned_output = ""
+
+                    if is_complete:
+                        # Reset miss count on successful match
+                        self._sm._prompt_miss_count[session_key] = 0
+                        consecutive_misses = 0
+
+                        # If this was a context-changing command, recapture the prompt
+                        if context_changing:
+                            logger.info(
+                                "Recapturing prompt after context-changing command"
+                            )
+                            with self._sm._lock:
+                                self._sm._session_prompts.pop(session_key, None)
+                            self._sm._capture_prompt(session_key, shell)
+
+                        return cleaned_output, "", 0, None, sentinel
+
+                    else:
+                        consecutive_misses += 1
+
+                        # If we've had too many consecutive misses, try recapturing the prompt
+                        if consecutive_misses > 10:
+                            miss_count = self._sm._prompt_miss_count.get(session_key, 0) + 1
+                            self._sm._prompt_miss_count[session_key] = miss_count
+
+                            if miss_count > 3:
+                                logger.warning(
+                                    f"Prompt detection failing repeatedly ({miss_count} times), recapturing for {session_key}"
+                                )
+                                with self._sm._lock:
+                                    self._sm._session_prompts.pop(session_key, None)
+                                    self._sm._session_prompt_patterns.pop(session_key, None)
+
+                                # Try to clear any stuck state with Ctrl+C
+                                logger.info(
+                                    f"Sending Ctrl+C to clear stuck state for {session_key}"
+                                )
+                                try:
+                                    shell.send(b"\x03")
+                                    time.sleep(0.5)
+                                    # Clear any output from Ctrl+C
+                                    if shell.recv_ready():
+                                        shell.recv(4096)
+                                except Exception as e:
+                                    logger.warning(f"Error sending Ctrl+C: {e}")
+
+                                # Try to recapture prompt
+                                self._sm._capture_prompt(session_key, shell)
+                                self._sm._ensure_prompt_pattern(
+                                    session_key, client, raw_output, shell
+                                )
+                                consecutive_misses = 0
+                                logger.info("Recaptured prompt and regenerated pattern")
+
+                            # Nuclear option: if we've tried many times, reset the shell
+                            if miss_count > 5:
+                                logger.error(
+                                    f"Prompt detection failed {miss_count} times for {session_key}. "
+                                    f"Shell state may be corrupted. Consider closing and recreating the session."
+                                )
+                                # Mark the shell as needing reset by closing it
+                                # The next command will create a new shell
+                                try:
+                                    shell.close()
+                                except Exception:
+                                    pass
+                                if session_key in self._sm._session_shells:
+                                    del self._sm._session_shells[session_key]
+                                # Return error indicating session needs reset
+                                return (
+                                    self._sm._strip_sentinel(raw_output, sentinel),
+                                    "Session state corrupted. The session has been reset. Please retry your command.",
+                                    1,
+                                    None,
+                                    sentinel,
+                                )
+                else:
+                    # No data available - check if we should timeout from inactivity
+                    if raw_output and (time.time() - last_recv_time) > idle_timeout:
+                        clean_output = self._sm._strip_ansi(raw_output)
+
+                        # Check for interactive prompts BEFORE checking for completion
+                        awaiting = self._sm._detect_awaiting_input(raw_output, session_key)
+                        if awaiting:
+                            logger.info(
+                                f"Detected interactive prompt during idle timeout: {awaiting}"
+                            )
+                            # Automatically handle pagers by sending 'q' to quit
+                            if awaiting == "pager":
+                                logger.info(
+                                    "Automatically handling pager during idle timeout - sending 'q' to quit"
+                                )
+
+                                # Strip MikroTik pager prompt from output to avoid agent confusion
+                                raw_output = re.sub(
+                                    r"--\s*\[Q quit\|D dump\|.*?\]\s*$", "", raw_output
+                                )
+
+                                shell.send(b"q")
+                                # Wait for pager to exit and shell prompt to appear
+                                pager_exit_start = time.time()
+                                pager_exit_timeout = 3.0
+                                while (
+                                    time.time() - pager_exit_start < pager_exit_timeout
+                                ):
+                                    time.sleep(0.1)
+                                    if shell.recv_ready():
+                                        chunk = shell.recv(4096).decode(
+                                            "utf-8", errors="ignore"
+                                        )
+                                        logger.debug(
+                                            f"Received chunk (idle-pager): {chunk!r}"
+                                        )
+                                        self._sm._feed_emulator(session_key, chunk)
+                                        limited_chunk, should_continue = (
+                                            output_limiter.add_chunk(chunk)
+                                        )
+                                        raw_output += limited_chunk
+                                        if not should_continue:
+                                            return (
+                                                raw_output,
+                                                "Output limit exceeded",
+                                                124,
+                                                None,
+                                                sentinel,
+                                            )
+                                        # Check if we now have the shell prompt
+                                        clean_output = self._sm._strip_ansi(raw_output)
+                                        tail_start = echo_end_pos or 0
+                                        tail_clean = clean_output[tail_start:]
+                                        is_complete, cleaned_output = (
+                                            self._sm._check_prompt_completion(
+                                                session_key, raw_output, tail_clean
+                                            )
+                                        )
+                                        if is_complete:
+                                            logger.debug(
+                                                "Shell prompt detected after quitting pager (idle)"
+                                            )
+                                            return cleaned_output, "", 0, None, sentinel
+
+                                # Reset idle timer and continue collecting
+                                last_recv_time = time.time()
+                                logger.debug(
+                                    "Pager quit during idle, continuing to wait for shell prompt"
+                                )
+                                continue
+                            # For other types of input (password, etc.), return and let agent handle
+                            # Only return awaiting input if prompt isn't already visible
+                            tail_start = echo_end_pos or 0
+                            tail_clean = clean_output[tail_start:]
+                            is_complete, _ = self._sm._check_prompt_completion(
+                                session_key, raw_output, tail_clean
+                            )
+                            if not is_complete:
+                                return (
+                                    self._sm._strip_sentinel(raw_output, sentinel),
+                                    "",
+                                    0,
+                                    awaiting,
+                                    sentinel,
+                                )
+
+                        # Only complete on idle timeout if we detect a prompt
+                        tail_start = echo_end_pos or 0
+                        tail_clean = clean_output[tail_start:]
+                        is_complete, cleaned_output = self._sm._check_prompt_completion(
+                            session_key, raw_output, tail_clean
+                        )
+                        if is_complete:
+                            logger.debug(
+                                "Prompt found in cleaned output during idle timeout"
+                            )
+
+                            # If sentinel is active, verify sentinel presence even on idle timeout
+                            if sentinel:
+                                if sentinel in raw_output:
+                                    # Sentinel found, we can proceed
+                                    # Logic handled in main loop, but here we are in idle block
+                                    # Let main loop handle it in next iteration (idle doesn't break loop unless we return)
+                                    pass
+                                else:
+                                    # Sentinel NOT found, but prompt found.
+                                    # This is the ambiguous case.
+                                    # If we return here, we risk the bug.
+                                    # If we don't, we risk hanging if sentinel is lost.
+                                    # Given the bug report, we MUST prioritize avoiding false positives.
+                                    # So we ignore the prompt if sentinel is missing.
+                                    logger.debug(
+                                        "Sentinel active but not found - ignoring prompt detection on idle"
+                                    )
+                                    is_complete = False
+
+                        if is_complete:
+                            # If this was a context-changing command, recapture the prompt
+                            if context_changing:
+                                logger.info(
+                                    "Recapturing prompt after context-changing command (idle timeout)"
+                                )
+                                with self._sm._lock:
+                                    self._sm._session_prompts.pop(session_key, None)
+                                self._sm._capture_prompt(session_key, shell)
+
+                            return cleaned_output, "", 0, None, sentinel
+                    time.sleep(0.1)
+
+            logger.warning(f"Command timed out after {timeout}s")
+            # Final join to ensure all output is returned
+            raw_output = "".join(raw_output_chunks)
+            return (
+                self._sm._strip_sentinel(raw_output, sentinel).strip(),
+                f"Command timed out after {timeout} seconds",
+                124,
+                None,
+                sentinel,
+            )
+
+        except Exception as exc:
+            logger.logger.error(f"Error executing command: {exc}", exc_info=True)
+            if session_key in self._sm._session_shells:
+                try:
+                    self._sm._session_shells[session_key].close()
+                except Exception:
+                    pass
+                del self._sm._session_shells[session_key]
+            return "", f"Error: {exc}", 1, None, sentinel
+        finally:
+            with self._sm._lock:
+                self._sm._active_commands.pop(session_key, None)
+
+
+    async def _execute_enable_mode_command_internal(
         self,
         client: paramiko.SSHClient,
         session_key: str,
@@ -1375,11 +2163,110 @@ class CommandExecutor:
         enable_command: str,
         timeout: int,
     ) -> tuple[str, str, int]:
-        """Internal method to execute command in enable mode on network device."""
-        import asyncio
+        """Execute a command while the session is in enable mode using the persistent shell."""
+        logger = self._sm.logger.getChild("enable_mode_command")
 
-        return asyncio.run(
-            self._session_manager._execute_enable_mode_command_internal(
-                client, session_key, command, enable_password, enable_command, timeout
+        try:
+            # Get the persistent shell for this session
+            shell = self._sm._get_or_create_shell(session_key, client)
+            shell.settimeout(timeout)
+
+            # Validate enable mode state if we think we are enabled
+            if self._sm._enable_mode.get(session_key, False):
+                # Clear pending output first
+                if shell.recv_ready():
+                    shell.recv(4096)
+
+                # Check prompt
+                shell.send(b"\n")
+                await asyncio.sleep(0.5)
+
+                if shell.recv_ready():
+                    output = shell.recv(4096).decode("utf-8", errors="ignore")
+                    clean = self._sm._strip_ansi(output).strip()
+                    # Check if prompt ends with # (standard enable mode indicator)
+                    # We also check if it contains '>' which usually indicates user mode
+                    if (
+                        clean
+                        and not clean.endswith("#")
+                        and (clean.endswith(">") or ">" in clean.splitlines()[-1])
+                    ):
+                        logger.warning(
+                            f"Enable mode validation failed. Prompt '{clean}' does not appear to be enable mode. Re-entering enable mode."
+                        )
+                        self._sm._enable_mode[session_key] = False
+
+            # Enter enable mode if not already in it
+            if not self._sm._enable_mode.get(session_key, False):
+                success, message = await self._sm._enter_enable_mode(
+                    session_key, client, enable_password, enable_command
+                )
+                if not success:
+                    return "", f"Failed to enter enable mode: {message}", 1
+
+            # Clear any pending output
+            if shell.recv_ready():
+                shell.recv(4096)
+
+            # Send the command
+            shell.send(f"{command}\n".encode())
+            await asyncio.sleep(0.5)
+
+            output_limiter = OutputLimiter()
+            raw_output = ""
+            start_time = time.time()
+            last_output_time = time.time()
+            idle_timeout = 2.0  # Consider command complete after 2 seconds of no output
+
+            while time.time() - start_time < timeout:
+                if shell.recv_ready():
+                    chunk = shell.recv(4096).decode("utf-8", errors="ignore")
+                    logger.debug(f"Received chunk: {chunk!r}")
+                    self._sm._feed_emulator(session_key, chunk)
+                    limited_chunk, should_continue = output_limiter.add_chunk(chunk)
+                    raw_output += limited_chunk
+                    last_output_time = time.time()
+
+                    if not should_continue:
+                        break
+
+                    # Use proper prompt detection instead of naive character checking
+                    clean_output = re.sub(r"\x1b\[[0-9;]*[mGKHF]", "", raw_output)
+                    is_complete, _ = self._sm._check_prompt_completion(
+                        session_key, raw_output, clean_output
+                    )
+                    if is_complete:
+                        logger.debug("Prompt detected - command complete")
+                        break
+                else:
+                    # No data available - check if we've been idle long enough
+                    if time.time() - last_output_time >= idle_timeout and raw_output:
+                        logger.debug(
+                            f"Idle timeout reached after {idle_timeout}s - command appears complete"
+                        )
+                        break
+                    await asyncio.sleep(0.1)
+            else:
+                return raw_output, f"Command timed out after {timeout} seconds", 124
+
+            # Clean up the output using proper prompt detection
+            clean_output = re.sub(r"\x1b\[[0-9;]*[mGKHF]", "", raw_output)
+            is_complete, cleaned_output = self._sm._check_prompt_completion(
+                session_key, raw_output, clean_output
             )
-        )
+
+            # Remove the command echo (first line)
+            lines = cleaned_output.split("\n")
+            if len(lines) > 1 and lines[0].strip() in command:
+                # First line is command echo, skip it
+                output = "\n".join(lines[1:]).strip()
+            else:
+                output = cleaned_output.strip()
+
+            return output, "", 0
+
+        except Exception as exc:
+            logger.logger.error(f"Enable mode command error: {exc}", exc_info=True)
+            return "", f"Error executing enable mode command: {exc}", 1
+
+

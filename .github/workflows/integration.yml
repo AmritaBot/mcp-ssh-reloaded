@@ -1,0 +1,103 @@
+name: Integration (real SSH)
+
+# The main CI job runs the suite without SSH_TEST_HOST, so every integration
+# test is skipped there.  This workflow stands up a local sshd container and
+# runs those tests for real.  Network-device / MikroTik suites still need
+# physical hardware and stay excluded.
+
+on:
+  push:
+    branches:
+      - "main"
+  pull_request:
+    branches:
+      - "main"
+  workflow_dispatch:
+
+permissions:
+  checks: write
+  contents: read
+  pull-requests: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Build sshd test target
+        run: docker build -t mcp-ssh-test .github/sshd-test
+
+      - name: Start sshd test target
+        run: docker run -d --name sshd-test -p 127.0.0.1:2222:22 mcp-ssh-test
+
+      - name: Wait for sshd
+        run: |
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/2222) 2>/dev/null; then
+              echo "sshd is accepting connections"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "sshd did not come up in time"
+          docker logs sshd-test || true
+          exit 1
+
+      - name: Configure default SSH target
+        run: |
+          # test_streaming_async_output calls execute_command_async(host=...) with
+          # no credentials, so it resolves through ~/.ssh/config.  Give that path
+          # a key-authenticated default.
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          ssh-keygen -t ed25519 -f "$HOME/.ssh/mcp_ssh_test" -N "" -C mcp-ssh-test
+          PUB="$(cat "$HOME/.ssh/mcp_ssh_test.pub")"
+          docker exec sshd-test sh -c "mkdir -p /home/tester/.ssh /root/.ssh \
+              && chmod 700 /home/tester/.ssh /root/.ssh \
+              && echo '$PUB' > /home/tester/.ssh/authorized_keys \
+              && cp /home/tester/.ssh/authorized_keys /root/.ssh/authorized_keys \
+              && chmod 600 /home/tester/.ssh/authorized_keys /root/.ssh/authorized_keys \
+              && chown -R tester:tester /home/tester/.ssh"
+          printf 'Host 127.0.0.1\n    HostName 127.0.0.1\n    User root\n    Port 2222\n    IdentityFile %s\n    IdentitiesOnly yes\n' \
+              "$HOME/.ssh/mcp_ssh_test" > "$HOME/.ssh/config"
+          chmod 600 "$HOME/.ssh/config"
+
+      - name: Run integration tests
+        env:
+          SSH_TEST_HOST: 127.0.0.1
+          SSH_TEST_PORT: "2222"
+          SSH_TEST_USER: root
+          SSH_TEST_PASSWORD: rootpass
+          SSH_TEST_SUDO_PASSWORD: rootpass
+        run: |
+          uv run pytest tests/ -v \
+            --ignore=tests/test_mikrotik.py \
+            --ignore=tests/test_network_devices.py \
+            --junitxml=integration-results.xml
+
+      - name: Publish integration report
+        uses: dorny/test-reporter@v1
+        if: success() || failure()
+        with:
+          name: Integration Tests (real SSH)
+          path: integration-results.xml
+          reporter: java-junit
+          fail-on-error: false
+
+      - name: Dump sshd logs on failure
+        if: failure()
+        run: docker logs sshd-test || true
