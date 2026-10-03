@@ -108,10 +108,15 @@ class OutputBuffer:
         if not self.truncated:
             return text
 
-        head = text[: self.head_size]
-        tail = text[-self.tail_size :] if len(text) > self.tail_size else ""
-        omitted = max(0, len(text) - len(head) - len(tail))
-        rendered = f"{head}\n\n... [{omitted} characters omitted] ...\n\n{tail}"
+        encoded = text.encode("utf-8")
+        head = encoded[: self.head_size].decode("utf-8", "ignore")
+        tail = (
+            encoded[-self.tail_size :].decode("utf-8", "ignore")
+            if len(encoded) > self.tail_size
+            else ""
+        )
+        omitted = max(0, len(encoded) - self.head_size - self.tail_size)
+        rendered = f"{head}\n\n... [{omitted} bytes omitted] ...\n\n{tail}"
         if self.spilled_path:
             rendered += f"\n\n[full output saved to {self.spilled_path}]"
         return rendered
@@ -134,3 +139,11 @@ class OutputBuffer:
                 self._spill.close()
             finally:
                 self._spill = None
+
+    def __del__(self) -> None:
+        # Best-effort: the spill file itself is a deliverable and stays on
+        # disk, but the descriptor must not outlive the buffer.
+        try:
+            self.close()
+        except Exception:
+            pass

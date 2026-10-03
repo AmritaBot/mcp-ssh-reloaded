@@ -470,6 +470,7 @@ class CommandExecutor:
         # so this normally returns almost immediately.
         exec_lock = self._sm.registry.execution_lock(session_key)
         exec_lock.acquire()
+        output_buffer = OutputBuffer(spill_dir=self.config.log_dir)
         try:
             with self._lock:
                 if command_id not in self._commands:
@@ -489,6 +490,7 @@ class CommandExecutor:
                     sudo_password,
                     timeout,
                     cancel_event=running_cmd.monitoring_cancelled,
+                    output_buffer=output_buffer,
                 )
                 result = _result_from_legacy(stdout, stderr, exit_code)
             elif enable_password:
@@ -502,6 +504,7 @@ class CommandExecutor:
                         enable_command,
                         timeout,
                         cancel_event=running_cmd.monitoring_cancelled,
+                        output_buffer=output_buffer,
                     )
                 )
                 result = _result_from_legacy(stdout, stderr, exit_code)
@@ -519,6 +522,7 @@ class CommandExecutor:
                     timeout,
                     session_key,
                     cancel_event=running_cmd.monitoring_cancelled,
+                    output_buffer=output_buffer,
                 )
                 result = _result_from_legacy(
                     stdout, stderr, exit_code, awaiting_input_reason, sentinel
@@ -532,6 +536,10 @@ class CommandExecutor:
                 f"status={result.status.value}, exit_code={result.exit_code}, "
                 f"awaiting_input={result.awaiting_input}"
             )
+
+            # Surface the buffer's verdict on the structured result.
+            result.truncated = output_buffer.truncated
+            result.spilled_path = output_buffer.spilled_path
 
             if running_cmd.monitoring_cancelled.is_set():
                 logger.info(f"Command {command_id} was interrupted")
@@ -620,6 +628,7 @@ class CommandExecutor:
                     running_cmd.status = CommandStatus.FAILED
                     running_cmd.end_time = datetime.now()
         finally:
+            output_buffer.close()
             exec_lock.release()
             # Cleanup old commands
             self._session_manager._cleanup_old_commands()
@@ -854,10 +863,10 @@ class CommandExecutor:
         last_recv_time = time.time()
         start_time = time.time()
 
-        # Initialize output limiter
-        output_buffer = OutputBuffer()
-        # Estimate current size
-        output_buffer.current_size = len(cmd.stdout.encode("utf-8"))
+        # Seed the buffer with output collected before monitoring started,
+        # so a spill file really does hold the whole stream.
+        output_buffer = OutputBuffer(spill_dir=self.config.log_dir)
+        output_buffer.add_chunk(cmd.stdout)
 
         last_log_time = 0.0
         poll_count = 0
@@ -1145,10 +1154,10 @@ class CommandExecutor:
         last_recv_time = time.time()
         start_time = time.time()
 
-        # Initialize output limiter
-        output_buffer = OutputBuffer()
-        # Estimate current size
-        output_buffer.current_size = len(cmd.stdout.encode("utf-8"))
+        # Seed the buffer with output collected before monitoring started,
+        # so a spill file really does hold the whole stream.
+        output_buffer = OutputBuffer(spill_dir=self.config.log_dir)
+        output_buffer.add_chunk(cmd.stdout)
 
         last_log_time = 0.0
         poll_count = 0
@@ -1519,6 +1528,7 @@ class CommandExecutor:
         timeout: int = 30,
         *,
         cancel_event: threading.Event | None = None,
+        output_buffer: OutputBuffer | None = None,
     ) -> tuple[str, str, int]:
         """Execute a sudo command using the persistent shell, handling password prompts.
 
@@ -1556,7 +1566,9 @@ class CommandExecutor:
             shell.send((command + "\n").encode("utf-8"))
             time.sleep(0.5)
 
-            output_buffer = OutputBuffer()
+            output_buffer = output_buffer or OutputBuffer(
+                spill_dir=self.config.log_dir
+            )
             raw_output = ""
             password_sent = False
             start_time = time.time()
@@ -1664,6 +1676,7 @@ class CommandExecutor:
         session_key: str,
         *,
         cancel_event: threading.Event | None = None,
+        output_buffer: OutputBuffer | None = None,
     ) -> tuple[str, str, int, str | None, str | None]:
         """Execute command with natural completion detection and interactive prompt detection.
 
@@ -1715,7 +1728,9 @@ class CommandExecutor:
             shell.send((command_to_send + "\n").encode("utf-8"))
             time.sleep(0.3)
 
-            output_buffer = OutputBuffer()
+            output_buffer = output_buffer or OutputBuffer(
+                spill_dir=self.config.log_dir
+            )
             raw_output = ""
             start_time = time.time()
             last_recv_time = start_time
@@ -1766,7 +1781,9 @@ class CommandExecutor:
             self._sm._ensure_prompt_pattern(session_key, client, shell=shell)
             consecutive_misses = 0  # Track consecutive prompt detection failures
 
-            output_buffer = OutputBuffer()
+            output_buffer = output_buffer or OutputBuffer(
+                spill_dir=self.config.log_dir
+            )
             raw_output_chunks = []
 
             while time.time() - start_time < timeout:
@@ -2217,6 +2234,7 @@ class CommandExecutor:
         timeout: int,
         *,
         cancel_event: threading.Event | None = None,
+        output_buffer: OutputBuffer | None = None,
     ) -> tuple[str, str, int]:
         """Execute a command while the session is in enable mode using the persistent shell."""
         logger = self._sm.logger.getChild("enable_mode_command")
@@ -2267,7 +2285,9 @@ class CommandExecutor:
             shell.send(f"{command}\n".encode())
             await asyncio.sleep(0.5)
 
-            output_buffer = OutputBuffer()
+            output_buffer = output_buffer or OutputBuffer(
+                spill_dir=self.config.log_dir
+            )
             raw_output = ""
             start_time = time.time()
             last_output_time = time.time()

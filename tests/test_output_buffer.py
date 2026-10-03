@@ -30,7 +30,7 @@ def test_large_output_keeps_head_and_tail():
     rendered = buf.render(text)
     assert rendered.startswith(text[:10])
     assert text[-10:] in rendered
-    assert "characters omitted" in rendered
+    assert "bytes omitted" in rendered
 
 
 def test_spill_file_holds_the_full_stream():

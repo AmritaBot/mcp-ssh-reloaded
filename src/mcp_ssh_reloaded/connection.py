@@ -207,21 +207,7 @@ class ConnectionManager:
                 logger.warning(f"Error closing client for {session_key}: {e}")
             del self.registry.sessions[session_key]
 
-        self.registry.shell_types.pop(session_key, None)
-        self.registry.prompt_patterns.pop(session_key, None)
-        self.registry.prompts.pop(session_key, None)
-        self.registry.shell_types.pop(session_key, None)
-
-        keys_to_remove = [
-            k
-            for k in list(self.registry.log_rate_limits.keys())
-            if k.startswith(f"{session_key}_")
-        ]
-        for k in keys_to_remove:
-            del self.registry.log_rate_limits[k]
-
-        if session_key in self.registry.enable_mode:
-            del self.registry.enable_mode[session_key]
+        self.registry.forget(session_key)
 
         logger.info(f"Session closed: {session_key}")
 
@@ -249,6 +235,7 @@ class ConnectionManager:
             self.registry.shell_types.clear()
             self.registry.prompt_patterns.clear()
             self.registry.prompts.clear()
+            self.registry.clear()
         logger.info("All sessions closed.")
 
     async def list_sessions(self) -> list[str]:
@@ -275,3 +262,4 @@ class ConnectionManager:
             self.registry.shell_types.clear()
             self.registry.prompt_patterns.clear()
             self.registry.prompts.clear()
+            self.registry.clear()

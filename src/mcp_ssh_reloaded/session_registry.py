@@ -87,7 +87,11 @@ class SessionRegistry:
         self.active_commands.pop(session_key, None)
         self.enable_mode.pop(session_key, None)
         with self._exec_locks_guard:
-            self._exec_locks.pop(session_key, None)
+            lock = self._exec_locks.get(session_key)
+            # Keep the lock if a worker still holds it - dropping it would
+            # let a second reader onto the same channel.
+            if lock is None or not lock.locked():
+                self._exec_locks.pop(session_key, None)
         for key in [
             k
             for k in list(self.log_rate_limits.keys())
