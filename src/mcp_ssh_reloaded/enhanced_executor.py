@@ -73,11 +73,11 @@ class EnhancedCommandExecutor:
         )
 
         # Same validation as the plain path, so both entry points agree.
-        is_valid, error_msg = self.session_manager._command_validator.validate_command(
+        is_valid, error_msg = self.session_manager.command_validator.validate_command(
             command,
             pty_aware=(
-                self.session_manager._interactive_mode
-                and self.session_manager._pty_aware_validation
+                self.session_manager.interactive_mode
+                and self.session_manager.pty_aware_validation
             ),
         )
         if not is_valid:

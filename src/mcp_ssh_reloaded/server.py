@@ -336,7 +336,7 @@ async def send_input_by_session(
     """Send input to the active shell for a session."""
     svc = _service()
     _, _, _, _, session_key = svc.engine._resolve_connection(host, username, port)
-    shell = svc.engine._session_shells.get(session_key)
+    shell = svc.engine.registry.shells.get(session_key)
     if not shell:
         return "Error: No active shell for this session"
     try:
@@ -386,7 +386,7 @@ def send_keys(
 
     svc = _service()
     _, _, _, _, session_key = svc.engine._resolve_connection(host, username, port)
-    shell = svc.engine._session_shells.get(session_key)
+    shell = svc.engine.registry.shells.get(session_key)
     if not shell:
         return "Error: No active shell"
     try:

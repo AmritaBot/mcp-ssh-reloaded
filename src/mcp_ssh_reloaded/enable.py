@@ -25,11 +25,11 @@ class EnableMode:
 
     @property
     def _enable_mode(self):
-        return self._sm._enable_mode
+        return self._sm.registry.enable_mode
 
     @property
     def _session_prompts(self):
-        return self._sm._session_prompts
+        return self._sm.registry.prompts
 
     @property
     def logger(self):

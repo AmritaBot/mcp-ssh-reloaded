@@ -6,6 +6,7 @@ import asyncio
 import atexit
 import logging
 import re
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -21,7 +22,7 @@ if TYPE_CHECKING:
     from mcp_ssh_reloaded.session_manager import SSHSessionManager
 
 from .models import CommandStatus, ExecutionResult, RunningCommand
-from .validation import OutputLimiter
+from .output_buffer import OutputBuffer
 
 
 def _result_from_legacy(
@@ -146,11 +147,11 @@ class CommandExecutor:
         )
 
         # Validate command
-        is_valid, error_msg = self._session_manager._command_validator.validate_command(
+        is_valid, error_msg = self._session_manager.command_validator.validate_command(
             command,
             pty_aware=(
-                self._session_manager._interactive_mode
-                and self._session_manager._pty_aware_validation
+                self._session_manager.interactive_mode
+                and self._session_manager.pty_aware_validation
             ),
         )
         if not is_valid:
@@ -398,6 +399,7 @@ class CommandExecutor:
                         cmd.stderr += (
                             f"\n[Auto-interrupted after {cmd_age:.0f}s due to timeout]"
                         )
+                        cmd.monitoring_cancelled.set()
 
                         # Collect shell to interrupt OUTSIDE the lock to avoid deadlock
                         stuck_shells.append(cmd.shell)
@@ -463,6 +465,11 @@ class CommandExecutor:
         logger = self.logger.getChild("async_worker")
         logger.debug(f"[WORKER_START] command_id={command_id}")
 
+        # Only one read loop may hold a session's shell at a time.  The
+        # previous holder is signalled to stop by interrupt/auto-recovery,
+        # so this normally returns almost immediately.
+        exec_lock = self._sm.registry.execution_lock(session_key)
+        exec_lock.acquire()
         try:
             with self._lock:
                 if command_id not in self._commands:
@@ -477,7 +484,11 @@ class CommandExecutor:
             if sudo_password:
                 logger.debug(f"Executing as sudo for {command_id}")
                 stdout, stderr, exit_code = self._execute_sudo_command_internal(
-                    client, command, sudo_password, timeout
+                    client,
+                    command,
+                    sudo_password,
+                    timeout,
+                    cancel_event=running_cmd.monitoring_cancelled,
                 )
                 result = _result_from_legacy(stdout, stderr, exit_code)
             elif enable_password:
@@ -490,6 +501,7 @@ class CommandExecutor:
                         enable_password,
                         enable_command,
                         timeout,
+                        cancel_event=running_cmd.monitoring_cancelled,
                     )
                 )
                 result = _result_from_legacy(stdout, stderr, exit_code)
@@ -502,7 +514,11 @@ class CommandExecutor:
                     awaiting_input_reason,
                     sentinel,
                 ) = self._execute_standard_command_internal(
-                    client, command, timeout, session_key
+                    client,
+                    command,
+                    timeout,
+                    session_key,
+                    cancel_event=running_cmd.monitoring_cancelled,
                 )
                 result = _result_from_legacy(
                     stdout, stderr, exit_code, awaiting_input_reason, sentinel
@@ -516,6 +532,17 @@ class CommandExecutor:
                 f"status={result.status.value}, exit_code={result.exit_code}, "
                 f"awaiting_input={result.awaiting_input}"
             )
+
+            if running_cmd.monitoring_cancelled.is_set():
+                logger.info(f"Command {command_id} was interrupted")
+                with self._lock:
+                    if command_id in self._commands:
+                        running_cmd.stdout = result.stdout
+                        running_cmd.stderr = result.stderr or "Command interrupted"
+                        running_cmd.exit_code = result.exit_code
+                        running_cmd.status = CommandStatus.INTERRUPTED
+                        running_cmd.end_time = datetime.now()
+                return
 
             # Handle timeout case - command is still running on remote shell
             if result.status is CommandStatus.RUNNING:
@@ -593,6 +620,7 @@ class CommandExecutor:
                     running_cmd.status = CommandStatus.FAILED
                     running_cmd.end_time = datetime.now()
         finally:
+            exec_lock.release()
             # Cleanup old commands
             self._session_manager._cleanup_old_commands()
 
@@ -650,6 +678,9 @@ class CommandExecutor:
             shell_to_interrupt = cmd.shell
             cmd.status = CommandStatus.INTERRUPTED
             cmd.end_time = datetime.now()
+            # Stop the worker's read loop too, otherwise it keeps draining
+            # the channel and starves the next command.
+            cmd.monitoring_cancelled.set()
 
         if shell_to_interrupt:
             try:
@@ -742,7 +773,7 @@ class CommandExecutor:
         logger = self.logger.getChild("retrieve_exit_code")
         try:
             # Determine correct syntax for exit code check
-            shell_type = self._session_manager._session_shell_types.get(
+            shell_type = self._session_manager.registry.shell_types.get(
                 session_key, "unknown"
             ).lower()
             if "fish" in shell_type:
@@ -824,9 +855,9 @@ class CommandExecutor:
         start_time = time.time()
 
         # Initialize output limiter
-        output_limiter = OutputLimiter()
+        output_buffer = OutputBuffer()
         # Estimate current size
-        output_limiter.current_size = len(cmd.stdout.encode("utf-8"))
+        output_buffer.current_size = len(cmd.stdout.encode("utf-8"))
 
         last_log_time = 0.0
         poll_count = 0
@@ -875,7 +906,7 @@ class CommandExecutor:
                             self._session_manager._feed_emulator(session_key, chunk)
 
                             # Apply output limiting
-                            chunk_to_add, should_continue = output_limiter.add_chunk(
+                            chunk_to_add, should_continue = output_buffer.add_chunk(
                                 chunk
                             )
 
@@ -894,7 +925,7 @@ class CommandExecutor:
                                             cmd.stdout += "".join(cmd.output_chunks)
                                             cmd.output_chunks = []
                                         cmd.status = CommandStatus.FAILED
-                                        cmd.stderr += f"\nOutput limit of {output_limiter.max_size} bytes exceeded."
+                                        cmd.stderr += f"\n{output_buffer.limit_message}"
                                         cmd.end_time = datetime.now()
                                 return
 
@@ -1115,9 +1146,9 @@ class CommandExecutor:
         start_time = time.time()
 
         # Initialize output limiter
-        output_limiter = OutputLimiter()
+        output_buffer = OutputBuffer()
         # Estimate current size
-        output_limiter.current_size = len(cmd.stdout.encode("utf-8"))
+        output_buffer.current_size = len(cmd.stdout.encode("utf-8"))
 
         last_log_time = 0.0
         poll_count = 0
@@ -1140,7 +1171,7 @@ class CommandExecutor:
                             self._session_manager._feed_emulator(cmd.session_key, chunk)
 
                             # Apply output limiting
-                            chunk_to_add, should_continue = output_limiter.add_chunk(
+                            chunk_to_add, should_continue = output_buffer.add_chunk(
                                 chunk
                             )
 
@@ -1159,7 +1190,7 @@ class CommandExecutor:
                                             cmd.stdout += "".join(cmd.output_chunks)
                                             cmd.output_chunks = []
                                         cmd.status = CommandStatus.FAILED
-                                        cmd.stderr += f"\nOutput limit of {output_limiter.max_size} bytes exceeded."
+                                        cmd.stderr += f"\n{output_buffer.limit_message}"
                                         cmd.end_time = datetime.now()
                                 return
 
@@ -1486,6 +1517,8 @@ class CommandExecutor:
         command: str,
         sudo_password: str,
         timeout: int = 30,
+        *,
+        cancel_event: threading.Event | None = None,
     ) -> tuple[str, str, int]:
         """Execute a sudo command using the persistent shell, handling password prompts.
 
@@ -1498,8 +1531,8 @@ class CommandExecutor:
         # We need to derive the session key from the client
         # Find the session key that matches this client
         session_key = None
-        with self._sm._lock:
-            for key, sess_client in self._sm._sessions.items():
+        with self._sm.registry.lock:
+            for key, sess_client in self._sm.registry.sessions.items():
                 if sess_client == client:
                     session_key = key
                     break
@@ -1523,7 +1556,7 @@ class CommandExecutor:
             shell.send((command + "\n").encode("utf-8"))
             time.sleep(0.5)
 
-            output_limiter = OutputLimiter()
+            output_buffer = OutputBuffer()
             raw_output = ""
             password_sent = False
             start_time = time.time()
@@ -1533,13 +1566,16 @@ class CommandExecutor:
             idle_check_count = 0
 
             while time.time() - start_time < timeout:
+                if cancel_event is not None and cancel_event.is_set():
+                    logger.info("Execution cancelled by caller")
+                    return raw_output, "Command interrupted", 130
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode("utf-8", errors="ignore")
                     logger.debug(f"Received chunk: {chunk!r}")
                     self._sm._feed_emulator(session_key, chunk)
                     last_recv_time = time.time()
                     idle_check_count = 0  # Reset idle check counter on new data
-                    limited_chunk, should_continue = output_limiter.add_chunk(chunk)
+                    limited_chunk, should_continue = output_buffer.add_chunk(chunk)
                     raw_output += limited_chunk
 
                     # Check for password prompt
@@ -1556,9 +1592,9 @@ class CommandExecutor:
 
                     if not should_continue:
                         return (
-                            raw_output,
-                            f"Output truncated at {output_limiter.max_size} bytes",
-                            124,
+                            output_buffer.render(raw_output),
+                            output_buffer.limit_message,
+                            1,
                         )
 
                     # Check for interactive prompts (SSH host key, etc.) BEFORE checking completion
@@ -1621,7 +1657,13 @@ class CommandExecutor:
 
 
     def _execute_standard_command_internal(
-        self, client: paramiko.SSHClient, command: str, timeout: int, session_key: str
+        self,
+        client: paramiko.SSHClient,
+        command: str,
+        timeout: int,
+        session_key: str,
+        *,
+        cancel_event: threading.Event | None = None,
     ) -> tuple[str, str, int, str | None, str | None]:
         """Execute command with natural completion detection and interactive prompt detection.
 
@@ -1642,8 +1684,8 @@ class CommandExecutor:
             shell = self._sm._get_or_create_shell(session_key, client)
             shell.settimeout(timeout)
 
-            with self._sm._lock:
-                self._sm._active_commands[session_key] = shell
+            with self._sm.registry.lock:
+                self._sm.registry.active_commands[session_key] = shell
 
             # Clear any pending output to avoid matching stale prompts
             if shell.recv_ready():
@@ -1654,7 +1696,7 @@ class CommandExecutor:
                     pass
 
             # Check shell type to decide on sentinel usage
-            shell_type = self._sm._session_shell_types.get(session_key, "unknown")
+            shell_type = self._sm.registry.shell_types.get(session_key, "unknown")
             logger.debug(f"Shell type for {session_key}: {shell_type}")
             is_unix = shell_type == "unix_shell"
 
@@ -1673,7 +1715,7 @@ class CommandExecutor:
             shell.send((command_to_send + "\n").encode("utf-8"))
             time.sleep(0.3)
 
-            output_limiter = OutputLimiter()
+            output_buffer = OutputBuffer()
             raw_output = ""
             start_time = time.time()
             last_recv_time = start_time
@@ -1724,16 +1766,27 @@ class CommandExecutor:
             self._sm._ensure_prompt_pattern(session_key, client, shell=shell)
             consecutive_misses = 0  # Track consecutive prompt detection failures
 
-            output_limiter = OutputLimiter()
+            output_buffer = OutputBuffer()
             raw_output_chunks = []
 
             while time.time() - start_time < timeout:
+                if cancel_event is not None and cancel_event.is_set():
+                    logger.info("Execution cancelled by caller")
+                    return (
+                        self._sm._strip_sentinel(
+                            "".join(raw_output_chunks), sentinel
+                        ).strip(),
+                        "Command interrupted",
+                        130,
+                        None,
+                        sentinel,
+                    )
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode("utf-8", errors="ignore")
                     logger.debug(f"Received chunk: {chunk!r}")
                     self._sm._feed_emulator(session_key, chunk)
                     last_recv_time = time.time()
-                    limited_chunk, should_continue = output_limiter.add_chunk(chunk)
+                    limited_chunk, should_continue = output_buffer.add_chunk(chunk)
                     raw_output_chunks.append(limited_chunk)
 
                     # Optimization: We primarily check for prompts/input on small chunks
@@ -1768,9 +1821,9 @@ class CommandExecutor:
                     if not should_continue:
                         logger.warning("Output limit reached")
                         return (
-                            "".join(raw_output_chunks),
-                            "Output limit exceeded",
-                            124,
+                            output_buffer.render("".join(raw_output_chunks)),
+                            output_buffer.limit_message,
+                            1,
                             None,
                             sentinel,
                         )
@@ -1830,15 +1883,15 @@ class CommandExecutor:
                                                 )
                                                 self._sm._feed_emulator(session_key, chunk)
                                                 limited_chunk, should_continue = (
-                                                    output_limiter.add_chunk(chunk)
+                                                    output_buffer.add_chunk(chunk)
                                                 )
                                                 raw_output_chunks.append(limited_chunk)
                                                 raw_output = "".join(raw_output_chunks)
                                                 if not should_continue:
                                                     return (
-                                                        raw_output,
-                                                        "Output limit exceeded",
-                                                        124,
+                                                        output_buffer.render(raw_output),
+                                                        output_buffer.limit_message,
+                                                        1,
                                                         None,
                                                         sentinel,
                                                     )
@@ -1926,7 +1979,7 @@ class CommandExecutor:
 
                     if is_complete:
                         # Reset miss count on successful match
-                        self._sm._prompt_miss_count[session_key] = 0
+                        self._sm.registry.prompt_miss_count[session_key] = 0
                         consecutive_misses = 0
 
                         # If this was a context-changing command, recapture the prompt
@@ -1934,8 +1987,8 @@ class CommandExecutor:
                             logger.info(
                                 "Recapturing prompt after context-changing command"
                             )
-                            with self._sm._lock:
-                                self._sm._session_prompts.pop(session_key, None)
+                            with self._sm.registry.lock:
+                                self._sm.registry.prompts.pop(session_key, None)
                             self._sm._capture_prompt(session_key, shell)
 
                         return cleaned_output, "", 0, None, sentinel
@@ -1945,16 +1998,16 @@ class CommandExecutor:
 
                         # If we've had too many consecutive misses, try recapturing the prompt
                         if consecutive_misses > 10:
-                            miss_count = self._sm._prompt_miss_count.get(session_key, 0) + 1
-                            self._sm._prompt_miss_count[session_key] = miss_count
+                            miss_count = self._sm.registry.prompt_miss_count.get(session_key, 0) + 1
+                            self._sm.registry.prompt_miss_count[session_key] = miss_count
 
                             if miss_count > 3:
                                 logger.warning(
                                     f"Prompt detection failing repeatedly ({miss_count} times), recapturing for {session_key}"
                                 )
-                                with self._sm._lock:
-                                    self._sm._session_prompts.pop(session_key, None)
-                                    self._sm._session_prompt_patterns.pop(session_key, None)
+                                with self._sm.registry.lock:
+                                    self._sm.registry.prompts.pop(session_key, None)
+                                    self._sm.registry.prompt_patterns.pop(session_key, None)
 
                                 # Try to clear any stuck state with Ctrl+C
                                 logger.info(
@@ -1989,8 +2042,8 @@ class CommandExecutor:
                                     shell.close()
                                 except Exception:
                                     pass
-                                if session_key in self._sm._session_shells:
-                                    del self._sm._session_shells[session_key]
+                                if session_key in self._sm.registry.shells:
+                                    del self._sm.registry.shells[session_key]
                                 # Return error indicating session needs reset
                                 return (
                                     self._sm._strip_sentinel(raw_output, sentinel),
@@ -2038,14 +2091,14 @@ class CommandExecutor:
                                         )
                                         self._sm._feed_emulator(session_key, chunk)
                                         limited_chunk, should_continue = (
-                                            output_limiter.add_chunk(chunk)
+                                            output_buffer.add_chunk(chunk)
                                         )
                                         raw_output += limited_chunk
                                         if not should_continue:
                                             return (
-                                                raw_output,
-                                                "Output limit exceeded",
-                                                124,
+                                                output_buffer.render(raw_output),
+                                                output_buffer.limit_message,
+                                                1,
                                                 None,
                                                 sentinel,
                                             )
@@ -2122,8 +2175,8 @@ class CommandExecutor:
                                 logger.info(
                                     "Recapturing prompt after context-changing command (idle timeout)"
                                 )
-                                with self._sm._lock:
-                                    self._sm._session_prompts.pop(session_key, None)
+                                with self._sm.registry.lock:
+                                    self._sm.registry.prompts.pop(session_key, None)
                                 self._sm._capture_prompt(session_key, shell)
 
                             return cleaned_output, "", 0, None, sentinel
@@ -2142,16 +2195,16 @@ class CommandExecutor:
 
         except Exception as exc:
             logger.logger.error(f"Error executing command: {exc}", exc_info=True)
-            if session_key in self._sm._session_shells:
+            if session_key in self._sm.registry.shells:
                 try:
-                    self._sm._session_shells[session_key].close()
+                    self._sm.registry.shells[session_key].close()
                 except Exception:
                     pass
-                del self._sm._session_shells[session_key]
+                del self._sm.registry.shells[session_key]
             return "", f"Error: {exc}", 1, None, sentinel
         finally:
-            with self._sm._lock:
-                self._sm._active_commands.pop(session_key, None)
+            with self._sm.registry.lock:
+                self._sm.registry.active_commands.pop(session_key, None)
 
 
     async def _execute_enable_mode_command_internal(
@@ -2162,6 +2215,8 @@ class CommandExecutor:
         enable_password: str,
         enable_command: str,
         timeout: int,
+        *,
+        cancel_event: threading.Event | None = None,
     ) -> tuple[str, str, int]:
         """Execute a command while the session is in enable mode using the persistent shell."""
         logger = self._sm.logger.getChild("enable_mode_command")
@@ -2172,7 +2227,7 @@ class CommandExecutor:
             shell.settimeout(timeout)
 
             # Validate enable mode state if we think we are enabled
-            if self._sm._enable_mode.get(session_key, False):
+            if self._sm.registry.enable_mode.get(session_key, False):
                 # Clear pending output first
                 if shell.recv_ready():
                     shell.recv(4096)
@@ -2194,10 +2249,10 @@ class CommandExecutor:
                         logger.warning(
                             f"Enable mode validation failed. Prompt '{clean}' does not appear to be enable mode. Re-entering enable mode."
                         )
-                        self._sm._enable_mode[session_key] = False
+                        self._sm.registry.enable_mode[session_key] = False
 
             # Enter enable mode if not already in it
-            if not self._sm._enable_mode.get(session_key, False):
+            if not self._sm.registry.enable_mode.get(session_key, False):
                 success, message = await self._sm._enter_enable_mode(
                     session_key, client, enable_password, enable_command
                 )
@@ -2212,18 +2267,21 @@ class CommandExecutor:
             shell.send(f"{command}\n".encode())
             await asyncio.sleep(0.5)
 
-            output_limiter = OutputLimiter()
+            output_buffer = OutputBuffer()
             raw_output = ""
             start_time = time.time()
             last_output_time = time.time()
             idle_timeout = 2.0  # Consider command complete after 2 seconds of no output
 
             while time.time() - start_time < timeout:
+                if cancel_event is not None and cancel_event.is_set():
+                    logger.info("Execution cancelled by caller")
+                    return raw_output, "Command interrupted", 130
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode("utf-8", errors="ignore")
                     logger.debug(f"Received chunk: {chunk!r}")
                     self._sm._feed_emulator(session_key, chunk)
-                    limited_chunk, should_continue = output_limiter.add_chunk(chunk)
+                    limited_chunk, should_continue = output_buffer.add_chunk(chunk)
                     raw_output += limited_chunk
                     last_output_time = time.time()
 

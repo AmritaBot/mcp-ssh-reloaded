@@ -16,7 +16,6 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-import aiologic
 import paramiko
 
 try:
@@ -34,6 +33,7 @@ from .enhanced_executor import EnhancedCommandExecutor
 from .file_manager import FileManager
 from .logging_manager import get_context_logger, get_logger
 from .session_diagnostics import ConnectionProfileManager, SessionDiagnosticsProvider
+from .session_registry import SessionRegistry
 from .validation import CommandValidator
 
 
@@ -57,30 +57,14 @@ class SSHSessionManager:
     MAX_FILE_TRANSFER_SIZE = 2 * 1024 * 1024
 
     def __init__(self, config=None):
-        self._sessions: dict[str, paramiko.SSHClient] = {}
+        # All per-session state lives here; see session_registry.py
+        self.registry = SessionRegistry()
         from .api_types import ServerConfig
 
         self.config = config if config is not None else ServerConfig()
-        self._enable_mode: dict[
-            str, bool
-        ] = {}  # Track which sessions are in enable mode
-        self._session_shells: dict[
-            str, paramiko.Channel
-        ] = {}  # Track persistent shells for stateful sessions
-        self._session_shell_types: dict[str, str] = {}
-        self._session_prompt_patterns: dict[str, re.Pattern] = {}
-        self._session_prompts: dict[str, str] = {}  # Store literal captured prompts
-        self._prompt_miss_count: dict[
-            str, int
-        ] = {}  # Track failed prompt matches for regeneration
-        self._lock = aiologic.Lock()
         self._ssh_config = ConnectionManager.load_ssh_config()
         self._command_validator = CommandValidator()
-        self._active_commands: dict[str, Any] = {}
         self._max_completed_commands = 100  # Keep last 100 completed commands
-        self._log_rate_limits: dict[
-            str, float
-        ] = {}  # Track last log time for rate limiting
 
         # Terminal emulator support (enabled by default in v0.2.0+)
         self._interactive_mode = os.environ.get("MCP_SSH_INTERACTIVE_MODE", "1") == "1"
@@ -90,10 +74,6 @@ class SSHSessionManager:
         self._mikrotik_auto_without_paging = (
             os.environ.get("MCP_SSH_MIKROTIK_AUTO_WITHOUT_PAGING", "1") == "1"
         )
-        self._session_emulators: dict[str, tuple[pyte.Screen, pyte.Stream]] = {}
-        self._session_modes: dict[
-            str, str
-        ] = {}  # Track mode: editor, pager, shell, password_prompt, unknown
 
         # Setup optimized logging
         self.logger = get_logger("ssh_session")
@@ -123,6 +103,23 @@ class SSHSessionManager:
 
         self.command_executor = CommandExecutor(self, config=self.config)
         self.file_manager = FileManager(self)
+
+    #  Read-only views (collaborators used to reach into privates)
+
+    @property
+    def command_validator(self):
+        """The shared command validator."""
+        return self._command_validator
+
+    @property
+    def interactive_mode(self) -> bool:
+        """Whether the PTY terminal emulator is enabled."""
+        return self._interactive_mode
+
+    @property
+    def pty_aware_validation(self) -> bool:
+        """Whether validation is relaxed for PTY inspection commands."""
+        return self._pty_aware_validation
 
     #  Delegates to ConnectionManager
 
@@ -189,8 +186,8 @@ class SSHSessionManager:
 
     def _feed_emulator(self, session_key: str, data: str) -> None:
         """Feed data to terminal emulator if interactive mode is enabled."""
-        if self._interactive_mode and session_key in self._session_emulators:
-            _, stream = self._session_emulators[session_key]
+        if self._interactive_mode and session_key in self.registry.emulators:
+            _, stream = self.registry.emulators[session_key]
             stream.feed(data)
             self._infer_mode_from_screen(session_key)
 
@@ -199,9 +196,9 @@ class SSHSessionManager:
     ):
         """Log a debug message only if enough time has passed since last log with this key."""
         now = time.time()
-        last_time = self._log_rate_limits.get(key, 0.0)
+        last_time = self.registry.log_rate_limits.get(key, 0.0)
         if now - last_time >= interval:
-            self._log_rate_limits[key] = now
+            self.registry.log_rate_limits[key] = now
             logger.debug(msg)
 
     def _infer_mode_from_screen(self, session_key: str) -> str:
@@ -210,10 +207,10 @@ class SSHSessionManager:
         Returns:
             Mode string: 'editor', 'pager', 'password_prompt', 'shell', or 'unknown'
         """
-        if not self._interactive_mode or session_key not in self._session_emulators:
+        if not self._interactive_mode or session_key not in self.registry.emulators:
             return "unknown"
 
-        screen, _ = self._session_emulators[session_key]
+        screen, _ = self.registry.emulators[session_key]
 
         # Get screen content
         lines = []
@@ -253,8 +250,8 @@ class SSHSessionManager:
             elif re.search(r'passphrase[^:=\n"\']*:?\s*$', last_line, re.IGNORECASE):
                 mode = "password_prompt"
             # Check for shell prompt (has prompt pattern)
-            elif session_key in self._session_prompts:
-                prompt = self._session_prompts[session_key]
+            elif session_key in self.registry.prompts:
+                prompt = self.registry.prompts[session_key]
                 # Handle wildcard prompts
                 if "*" in prompt or "[" in prompt:
                     # Convert wildcard to regex
@@ -274,7 +271,7 @@ class SSHSessionManager:
                 mode = "unknown"
 
         # Store the mode
-        self._session_modes[session_key] = mode
+        self.registry.modes[session_key] = mode
         return mode
 
     def _get_screen_snapshot(self, session_key: str, max_lines: int = 24) -> dict:
@@ -283,7 +280,7 @@ class SSHSessionManager:
         Returns:
             dict with keys: lines (list of strings), cursor_x, cursor_y, width, height
         """
-        if not self._interactive_mode or session_key not in self._session_emulators:
+        if not self._interactive_mode or session_key not in self.registry.emulators:
             return {
                 "error": "Interactive mode not enabled or session not found",
                 "lines": [],
@@ -293,7 +290,7 @@ class SSHSessionManager:
                 "height": 0,
             }
 
-        screen, _ = self._session_emulators[session_key]
+        screen, _ = self.registry.emulators[session_key]
 
         # Get screen lines (pyte stores them as a dict keyed by line number)
         lines = []
@@ -317,29 +314,29 @@ class SSHSessionManager:
         """Get or create (or recreate) a persistent shell for a session."""
         logger = self.logger.getChild("shell")
 
-        if session_key in self._session_shells:
-            shell = self._session_shells[session_key]
+        if session_key in self.registry.shells:
+            shell = self.registry.shells[session_key]
             try:
                 transport = (
                     shell.get_transport() if hasattr(shell, "get_transport") else None
                 )
                 if shell.closed or not transport or not transport.is_active():
                     logger.info(f"Shell for {session_key} is dead, recreating")
-                    del self._session_shells[session_key]
+                    del self.registry.shells[session_key]
                 else:
-                    client_ref = self._sessions.get(session_key)
+                    client_ref = self.registry.sessions.get(session_key)
                     if client_ref:
                         self._ensure_shell_type(session_key, client_ref)
                         # Recapture prompt if not available
-                        if session_key not in self._session_prompts:
+                        if session_key not in self.registry.prompts:
                             self._capture_prompt(session_key, shell)
                     return shell
             except Exception as exc:
                 logger.warning(
                     f"Error checking shell for {session_key}: {exc}. Recreating."
                 )
-                if session_key in self._session_shells:
-                    del self._session_shells[session_key]
+                if session_key in self.registry.shells:
+                    del self.registry.shells[session_key]
 
         logger.info(f"Creating new persistent shell for {session_key}")
         shell = client.invoke_shell()
@@ -349,7 +346,7 @@ class SSHSessionManager:
         if self._interactive_mode:
             screen = pyte.Screen(100, 24)
             stream = pyte.Stream(screen)
-            self._session_emulators[session_key] = (screen, stream)
+            self.registry.emulators[session_key] = (screen, stream)
             logger.debug(f"Created terminal emulator for {session_key}")
 
         time.sleep(2)  # Give shell time to initialize
@@ -362,15 +359,15 @@ class SSHSessionManager:
                 logger.debug(f"Initial shell output chunk: {chunk!r}")
                 initial_output += chunk
                 # Feed to emulator if enabled
-                if self._interactive_mode and session_key in self._session_emulators:
-                    _, stream = self._session_emulators[session_key]
+                if self._interactive_mode and session_key in self.registry.emulators:
+                    _, stream = self.registry.emulators[session_key]
                     stream.feed(chunk)
             elif initial_output and (time.time() - start_wait > 1.0):
                 # We got some output and it's quiet, maybe it's done
                 break
             time.sleep(0.2)
 
-        self._session_shells[session_key] = shell
+        self.registry.shells[session_key] = shell
 
         # Build device profile from shell output instead of exec_command
         self._build_device_profile(session_key, initial_output)
@@ -380,7 +377,7 @@ class SSHSessionManager:
 
         # For non-POSIX Unix shells, start bash to avoid compatibility issues
         # We do this AFTER capturing the initial prompt to ensure the shell is responsive
-        device_type = self._session_shell_types.get(session_key, "unknown")
+        device_type = self.registry.shell_types.get(session_key, "unknown")
         if device_type == "unix_shell":
             # Detect non-POSIX shells (fish, nushell, elvish, etc.)
             is_non_posix = any(
@@ -493,7 +490,7 @@ class SSHSessionManager:
             else:
                 device_type = "unknown"
 
-        self._session_shell_types[session_key] = device_type
+        self.registry.shell_types[session_key] = device_type
 
         # Set up prompt pattern based on device type and actual output
         self._ensure_prompt_pattern(session_key, None, initial_output)  # pyright: ignore[reportArgumentType]
@@ -519,7 +516,7 @@ class SSHSessionManager:
         logger = self.logger.getChild("capture_prompt")
 
         try:
-            device_type = self._session_shell_types.get(session_key, "unknown")
+            device_type = self.registry.shell_types.get(session_key, "unknown")
             output = ""
             marker = None
 
@@ -601,9 +598,9 @@ class SSHSessionManager:
                         logger.info(
                             f"Detected MikroTik device from fallback output for {session_key}"
                         )
-                        self._session_shell_types[session_key] = "mikrotik"
+                        self.registry.shell_types[session_key] = "mikrotik"
                     elif "edgeswitch" in output_lower or "ubiquiti" in output_lower:
-                        self._session_shell_types[session_key] = "edgeswitch"
+                        self.registry.shell_types[session_key] = "edgeswitch"
                     elif any(c in output_lower for c in ["cisco", "ios", ">", "#"]):
                         # Very basic check for other network devices
                         if not any(s in output_lower for s in ["bash", "zsh", "fish"]):
@@ -612,7 +609,7 @@ class SSHSessionManager:
                             )
                             # Don't set to mikrotik, but maybe generic network_device
                             if device_type == "unknown":
-                                self._session_shell_types[session_key] = (
+                                self.registry.shell_types[session_key] = (
                                     "network_device"
                                 )
 
@@ -650,7 +647,7 @@ class SSHSessionManager:
             if generalized_prompt != prompt:
                 logger.debug(f"Generalized to: {generalized_prompt!r}")
 
-            self._session_prompts[session_key] = generalized_prompt
+            self.registry.prompts[session_key] = generalized_prompt
             return generalized_prompt
 
         except Exception as exc:
@@ -732,11 +729,11 @@ class SSHSessionManager:
 
     def _ensure_shell_type(self, session_key: str, client: paramiko.SSHClient) -> str:
         """Legacy method - now handled by _build_device_profile."""
-        if session_key in self._session_shell_types:
-            return self._session_shell_types[session_key]
+        if session_key in self.registry.shell_types:
+            return self.registry.shell_types[session_key]
 
         # Fallback for cases where profile wasn't built
-        self._session_shell_types[session_key] = "unknown"
+        self.registry.shell_types[session_key] = "unknown"
         return "unknown"
 
     def _ensure_prompt_pattern(
@@ -754,14 +751,14 @@ class SSHSessionManager:
             initial_output: Initial shell output to analyze
             shell: Interactive shell (preferred for reading PS1)
         """
-        if session_key in self._session_prompt_patterns:
-            return self._session_prompt_patterns[session_key]
+        if session_key in self.registry.prompt_patterns:
+            return self.registry.prompt_patterns[session_key]
 
         logger = self.logger.getChild("detect_prompt")
         pattern: re.Pattern | None = None
 
         # Try to detect shell type
-        shell_type = self._session_shell_types.get(session_key, "unknown").lower()
+        shell_type = self.registry.shell_types.get(session_key, "unknown").lower()
 
         # For Fish shell, use a more specific pattern to avoid false positives
         if "fish" in shell_type:
@@ -875,8 +872,8 @@ class SSHSessionManager:
             if pattern is None:
                 pattern = re.compile(r"[>#\$]\s*$")
 
-        self._session_prompt_patterns[session_key] = pattern
-        self._prompt_miss_count[session_key] = 0  # Reset miss count
+        self.registry.prompt_patterns[session_key] = pattern
+        self.registry.prompt_miss_count[session_key] = 0  # Reset miss count
         return pattern
 
     def _convert_ps1_to_pattern(self, prompt: str, logger) -> re.Pattern:
@@ -991,7 +988,7 @@ class SSHSessionManager:
         if not self._mikrotik_auto_without_paging:
             return command
 
-        if self._session_shell_types.get(session_key) != "mikrotik":
+        if self.registry.shell_types.get(session_key) != "mikrotik":
             return command
 
         # Avoid rewriting multiline/script commands.
@@ -1005,7 +1002,7 @@ class SSHSessionManager:
             return command
 
         command_starts_with_slash = command.lstrip().startswith("/")
-        prompt = self._session_prompts.get(session_key, "")
+        prompt = self.registry.prompts.get(session_key, "")
         menu_context = bool(re.search(r"\]\s+/[^>\s]*>\s*$", prompt))
 
         if not (command_starts_with_slash or menu_context):
@@ -1061,8 +1058,8 @@ class SSHSessionManager:
         logger = self.logger.getChild("prompt_check")
 
         # Strategy 1: Check for captured literal/generalized prompt (most reliable)
-        if session_key in self._session_prompts:
-            literal_prompt = self._session_prompts[session_key]
+        if session_key in self.registry.prompts:
+            literal_prompt = self.registry.prompts[session_key]
 
             # Optimization: Only check the end of the output for prompt match
             # Most prompts are on the last line or within a few hundred chars.
@@ -1123,8 +1120,8 @@ class SSHSessionManager:
                     return True, output
 
         # Strategy 2: Fall back to pattern matching
-        if session_key in self._session_prompt_patterns:
-            prompt_pattern = self._session_prompt_patterns[session_key]
+        if session_key in self.registry.prompt_patterns:
+            prompt_pattern = self.registry.prompt_patterns[session_key]
 
             # Only check the end of clean_output
             if len(clean_output) > 4096:
@@ -1152,8 +1149,8 @@ class SSHSessionManager:
         logger = self.logger.getChild("awaiting_input")
 
         # Mode-aware gating (only when interactive mode is enabled)
-        if self._interactive_mode and session_key in self._session_modes:
-            mode = self._session_modes.get(session_key, "unknown")
+        if self._interactive_mode and session_key in self.registry.modes:
+            mode = self.registry.modes.get(session_key, "unknown")
 
             # If in editor mode, don't flag as awaiting input
             # Editors handle their own input and shouldn't be interrupted
@@ -1304,8 +1301,8 @@ class SSHSessionManager:
         _, _, _, _, session_key = self._resolve_connection(host, username, port)
         logger.info(f"Sending input to session: {session_key}")
 
-        with self._lock:
-            shell = self._session_shells.get(session_key)
+        with self.registry.lock:
+            shell = self.registry.shells.get(session_key)
 
         if not shell:
             logger.error(f"No active shell for session: {session_key}")
