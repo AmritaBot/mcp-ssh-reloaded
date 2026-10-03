@@ -35,10 +35,10 @@ class SessionDiagnosticsProvider:
 
         diagnostics = SessionDiagnostics(session_key=session_key)
 
-        with self.session_manager._lock:
+        with self.session_manager.registry.lock:
             # Basic session info
-            client = self.session_manager._sessions.get(session_key)
-            shell = self.session_manager._session_shells.get(session_key)
+            client = self.session_manager.registry.sessions.get(session_key)
+            shell = self.session_manager.registry.shells.get(session_key)
 
             if not client:
                 diagnostics.connection_health = "dead"
@@ -56,27 +56,27 @@ class SessionDiagnosticsProvider:
                 diagnostics.connection_health = "dead"
 
             # Shell type and prompt info
-            diagnostics.shell_type = self.session_manager._session_shell_types.get(
+            diagnostics.shell_type = self.session_manager.registry.shell_types.get(
                 session_key
             )
-            diagnostics.captured_prompt = self.session_manager._session_prompts.get(
+            diagnostics.captured_prompt = self.session_manager.registry.prompts.get(
                 session_key
             )
 
             # Prompt pattern info
-            prompt_pattern = self.session_manager._session_prompt_patterns.get(
+            prompt_pattern = self.session_manager.registry.prompt_patterns.get(
                 session_key
             )
             if prompt_pattern:
                 diagnostics.prompt_pattern = prompt_pattern.pattern
                 # Calculate confidence based on recent prompt detection success
-                miss_count = self.session_manager._prompt_miss_count.get(session_key, 0)
+                miss_count = self.session_manager.registry.prompt_miss_count.get(session_key, 0)
                 diagnostics.prompt_detection_confidence = max(
                     0.0, 100.0 - (miss_count * 10.0)
                 )
 
             # Last activity
-            active_cmd = self.session_manager._active_commands.get(session_key)
+            active_cmd = self.session_manager.registry.active_commands.get(session_key)
             if active_cmd and hasattr(active_cmd, "last_output_time"):
                 diagnostics.last_activity = active_cmd.last_output_time
             else:
@@ -117,18 +117,18 @@ class SessionDiagnosticsProvider:
                 state["shell_exists"] = False
 
             # Enable mode state
-            state["enable_mode"] = self.session_manager._enable_mode.get(
+            state["enable_mode"] = self.session_manager.registry.enable_mode.get(
                 session_key, False
             )
 
             # Prompt detection state
             state["prompt_captured"] = (
-                session_key in self.session_manager._session_prompts
+                session_key in self.session_manager.registry.prompts
             )
             state["prompt_pattern_available"] = (
-                session_key in self.session_manager._session_prompt_patterns
+                session_key in self.session_manager.registry.prompt_patterns
             )
-            state["prompt_miss_count"] = self.session_manager._prompt_miss_count.get(
+            state["prompt_miss_count"] = self.session_manager.registry.prompt_miss_count.get(
                 session_key, 0
             )
 
@@ -167,17 +167,17 @@ class SessionDiagnosticsProvider:
         )
         logger.info(f"Resetting prompt detection for session: {session_key}")
 
-        with self.session_manager._lock:
-            shell = self.session_manager._session_shells.get(session_key)
+        with self.session_manager.registry.lock:
+            shell = self.session_manager.registry.shells.get(session_key)
             if not shell:
                 logger.error(f"No shell found for session: {session_key}")
                 return False
 
             try:
                 # Clear existing prompt data
-                self.session_manager._session_prompts.pop(session_key, None)
-                self.session_manager._session_prompt_patterns.pop(session_key, None)
-                self.session_manager._prompt_miss_count[session_key] = 0
+                self.session_manager.registry.prompts.pop(session_key, None)
+                self.session_manager.registry.prompt_patterns.pop(session_key, None)
+                self.session_manager.registry.prompt_miss_count[session_key] = 0
 
                 # Recapture prompt
                 self.session_manager._capture_prompt(session_key, shell)
@@ -194,16 +194,16 @@ class SessionDiagnosticsProvider:
 
         report = {
             "timestamp": datetime.now().isoformat(),
-            "total_sessions": len(self.session_manager._sessions),
+            "total_sessions": len(self.session_manager.registry.sessions),
             "healthy_sessions": 0,
             "degraded_sessions": 0,
             "dead_sessions": 0,
             "session_details": {},
         }
 
-        for session_key in list(self.session_manager._sessions.keys()):
+        for session_key in list(self.session_manager.registry.sessions.keys()):
             try:
-                client = self.session_manager._sessions[session_key]
+                client = self.session_manager.registry.sessions[session_key]
                 transport = client.get_transport()
 
                 if transport and transport.is_active():
@@ -214,16 +214,16 @@ class SessionDiagnosticsProvider:
                     report["dead_sessions"] += 1
 
                 # Get additional session info
-                shell_type = self.session_manager._session_shell_types.get(
+                shell_type = self.session_manager.registry.shell_types.get(
                     session_key, "unknown"
                 )
-                last_cmd = self.session_manager._active_commands.get(session_key)
+                last_cmd = self.session_manager.registry.active_commands.get(session_key)
 
                 report["session_details"][session_key] = {
                     "health": health,
                     "shell_type": shell_type,
                     "has_active_command": last_cmd is not None,
-                    "enable_mode": self.session_manager._enable_mode.get(
+                    "enable_mode": self.session_manager.registry.enable_mode.get(
                         session_key, False
                     ),
                 }
@@ -244,14 +244,14 @@ class SessionDiagnosticsProvider:
 
         try:
             # Check prompt detection confidence
-            miss_count = self.session_manager._prompt_miss_count.get(session_key, 0)
+            miss_count = self.session_manager.registry.prompt_miss_count.get(session_key, 0)
             if miss_count > 3:
                 suggestions.append(
                     "Consider resetting prompt detection - multiple misses detected"
                 )
 
             # Check shell type
-            shell_type = self.session_manager._session_shell_types.get(
+            shell_type = self.session_manager.registry.shell_types.get(
                 session_key, "unknown"
             )
             if shell_type == "unknown":
@@ -260,7 +260,7 @@ class SessionDiagnosticsProvider:
                 )
 
             # Check for long-running commands
-            active_cmd = self.session_manager._active_commands.get(session_key)
+            active_cmd = self.session_manager.registry.active_commands.get(session_key)
             if active_cmd and hasattr(active_cmd, "start_time"):
                 runtime = datetime.now() - active_cmd.start_time
                 if runtime.total_seconds() > 300:  # 5 minutes
@@ -270,7 +270,7 @@ class SessionDiagnosticsProvider:
 
             # Check connection issues
             try:
-                client = self.session_manager._sessions[session_key]
+                client = self.session_manager.registry.sessions[session_key]
                 transport = client.get_transport()
                 if not (transport and transport.is_active()):
                     suggestions.append(

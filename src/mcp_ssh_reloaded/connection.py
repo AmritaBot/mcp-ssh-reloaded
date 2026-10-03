@@ -30,43 +30,16 @@ class ConnectionManager:
     def __init__(self, sm: SSHSessionManager):
         self._sm = sm  # parent SessionManager for shared state access
 
-    # -- state accessors (delegate to SessionManager) --
+    # -- state accessors --
 
     @property
-    def _lock(self):
-        return self._sm._lock
-
-    @property
-    def _sessions(self):
-        return self._sm._sessions
+    def registry(self):
+        """The session registry that owns all per-session state."""
+        return self._sm.registry
 
     @property
     def logger(self):
         return self._sm.logger
-
-    @property
-    def _session_shells(self):
-        return self._sm._session_shells
-
-    @property
-    def _session_shell_types(self):
-        return self._sm._session_shell_types
-
-    @property
-    def _session_prompt_patterns(self):
-        return self._sm._session_prompt_patterns
-
-    @property
-    def _session_prompts(self):
-        return self._sm._session_prompts
-
-    @property
-    def _enable_mode(self):
-        return self._sm._enable_mode
-
-    @property
-    def _log_rate_limits(self):
-        return self._sm._log_rate_limits
 
     @property
     def _ssh_config(self):
@@ -140,9 +113,9 @@ class ConnectionManager:
         if env_pass := self.get_env_override(host, "PASS"):
             password = env_pass
 
-        with self._lock:
-            if session_key in self._sessions:
-                client = self._sessions[session_key]
+        with self.registry.lock:
+            if session_key in self.registry.sessions:
+                client = self.registry.sessions[session_key]
                 try:
                     transport = client.get_transport()
                     if transport and transport.is_active():
@@ -178,7 +151,7 @@ class ConnectionManager:
 
             try:
                 await asyncio.to_thread(client.connect, **connect_kwargs)
-                self._sessions[session_key] = client
+                self.registry.sessions[session_key] = client
                 logger.info(f"Successfully created new session: {session_key}")
                 return client
             except (
@@ -211,7 +184,7 @@ class ConnectionManager:
     ):
         _, _, _, _, session_key = self.resolve_connection(host, username, port)
         self.logger.info(f"Request to close session: {session_key}")
-        async with self._lock:
+        async with self.registry.lock:
             await asyncio.to_thread(self._close_session, session_key)
 
     def _close_session(self, session_key: str):
@@ -220,85 +193,73 @@ class ConnectionManager:
         logger.debug(f"Clearing commands for {session_key}")
         self.command_executor.clear_session_commands(session_key)
 
-        if session_key in self._session_shells:
+        if session_key in self.registry.shells:
             try:
-                self._session_shells[session_key].close()
+                self.registry.shells[session_key].close()
             except Exception as e:
                 logger.warning(f"Error closing shell for {session_key}: {e}")
-            del self._session_shells[session_key]
+            del self.registry.shells[session_key]
 
-        if session_key in self._sessions:
+        if session_key in self.registry.sessions:
             try:
-                self._sessions[session_key].close()
+                self.registry.sessions[session_key].close()
             except Exception as e:
                 logger.warning(f"Error closing client for {session_key}: {e}")
-            del self._sessions[session_key]
+            del self.registry.sessions[session_key]
 
-        self._session_shell_types.pop(session_key, None)
-        self._session_prompt_patterns.pop(session_key, None)
-        self._session_prompts.pop(session_key, None)
-        self._session_shell_types.pop(session_key, None)
-
-        keys_to_remove = [
-            k
-            for k in list(self._log_rate_limits.keys())
-            if k.startswith(f"{session_key}_")
-        ]
-        for k in keys_to_remove:
-            del self._log_rate_limits[k]
-
-        if session_key in self._enable_mode:
-            del self._enable_mode[session_key]
+        self.registry.forget(session_key)
 
         logger.info(f"Session closed: {session_key}")
 
     async def close_all_sessions(self):
         logger = self.logger.getChild("close_all")
         logger.info("Closing all active sessions and resources.")
-        async with self._lock:
+        async with self.registry.lock:
             logger.debug("Clearing all commands")
             self.command_executor.clear_all_commands()
 
-            for key, shell in list(self._session_shells.items()):
+            for key, shell in list(self.registry.shells.items()):
                 try:
                     shell.close()
                 except Exception as e:  # noqa: PERF203
                     logger.warning(f"Error closing shell for {key}: {e}")
-            self._session_shells.clear()
+            self.registry.shells.clear()
 
-            for key, client in list(self._sessions.items()):
+            for key, client in list(self.registry.sessions.items()):
                 try:
                     client.close()
                 except Exception as e:  # noqa: PERF203
                     logger.warning(f"Error closing client for {key}: {e}")
-            self._sessions.clear()
-            self._enable_mode.clear()
-            self._session_shell_types.clear()
-            self._session_prompt_patterns.clear()
-            self._session_prompts.clear()
+            self.registry.sessions.clear()
+            self.registry.enable_mode.clear()
+            self.registry.shell_types.clear()
+            self.registry.prompt_patterns.clear()
+            self.registry.prompts.clear()
+            self.registry.clear()
         logger.info("All sessions closed.")
 
     async def list_sessions(self) -> list[str]:
-        async with self._lock:
-            return list(self._sessions.keys())
+        async with self.registry.lock:
+            return list(self.registry.sessions.keys())
 
     def close_all_sessions_sync(self):
         """Synchronous fallback for __del__ (cannot await in destructor)."""
-        with self._lock:
+        with self.registry.lock:
             self.command_executor.clear_all_commands()
-            for key, shell in list(self._session_shells.items()):
+            for key, shell in list(self.registry.shells.items()):
                 try:
                     shell.close()
                 except Exception:  # noqa: PERF203
                     pass
-            self._session_shells.clear()
-            for key, client in list(self._sessions.items()):
+            self.registry.shells.clear()
+            for key, client in list(self.registry.sessions.items()):
                 try:
                     client.close()
                 except Exception:  # noqa: PERF203
                     pass
-            self._sessions.clear()
-            self._enable_mode.clear()
-            self._session_shell_types.clear()
-            self._session_prompt_patterns.clear()
-            self._session_prompts.clear()
+            self.registry.sessions.clear()
+            self.registry.enable_mode.clear()
+            self.registry.shell_types.clear()
+            self.registry.prompt_patterns.clear()
+            self.registry.prompts.clear()
+            self.registry.clear()

@@ -18,7 +18,7 @@ class TestInteractivePTY:
 
         manager = SSHSessionManager()
         assert manager._interactive_mode
-        assert len(manager._session_emulators) == 0
+        assert len(manager.registry.emulators) == 0
 
     def test_interactive_mode_can_be_disabled(self):
         """Test that interactive mode can be explicitly disabled."""
@@ -26,7 +26,7 @@ class TestInteractivePTY:
 
         manager = SSHSessionManager()
         assert not manager._interactive_mode
-        assert len(manager._session_emulators) == 0
+        assert len(manager.registry.emulators) == 0
 
         # Cleanup
         os.environ.pop("MCP_SSH_INTERACTIVE_MODE", None)
@@ -69,9 +69,9 @@ class TestInteractivePTY:
             assert len(sessions) > 0
 
             session_key = sessions[0]
-            assert session_key in manager._session_emulators
+            assert session_key in manager.registry.emulators
 
-            screen, stream = manager._session_emulators[session_key]
+            screen, stream = manager.registry.emulators[session_key]
             assert screen is not None
             assert stream is not None
 
@@ -233,8 +233,8 @@ class TestInteractivePTY:
             session_key = sessions[0]
 
             # Verify emulator exists
-            assert session_key in manager._session_emulators
-            emulator1 = manager._session_emulators[session_key]
+            assert session_key in manager.registry.emulators
+            emulator1 = manager.registry.emulators[session_key]
 
             # Second command
             _stdout2, _stderr2, exit2 = asyncio.run(
@@ -249,7 +249,7 @@ class TestInteractivePTY:
             assert exit2 == 0
 
             # Verify same emulator is used
-            emulator2 = manager._session_emulators[session_key]
+            emulator2 = manager.registry.emulators[session_key]
             assert emulator1 is emulator2
 
             # Get snapshot
@@ -291,7 +291,7 @@ class TestModeInference:
 
         screen = pyte.Screen(100, 24)
         stream = pyte.Stream(screen)
-        manager._session_emulators[session_key] = (screen, stream)
+        manager.registry.emulators[session_key] = (screen, stream)
 
         # Simulate vim insert mode output
         vim_output = "\n" * 20 + "-- INSERT --\n"
@@ -301,7 +301,7 @@ class TestModeInference:
         mode = manager._infer_mode_from_screen(session_key)
 
         assert mode == "editor"
-        assert manager._session_modes[session_key] == "editor"
+        assert manager.registry.modes[session_key] == "editor"
 
         os.environ.pop("MCP_SSH_INTERACTIVE_MODE", None)
 
@@ -316,7 +316,7 @@ class TestModeInference:
 
         screen = pyte.Screen(100, 24)
         stream = pyte.Stream(screen)
-        manager._session_emulators[session_key] = (screen, stream)
+        manager.registry.emulators[session_key] = (screen, stream)
 
         # Simulate vim with many tildes
         vim_output = "~\n" * 10
@@ -339,7 +339,7 @@ class TestModeInference:
 
         screen = pyte.Screen(100, 24)
         stream = pyte.Stream(screen)
-        manager._session_emulators[session_key] = (screen, stream)
+        manager.registry.emulators[session_key] = (screen, stream)
 
         # Simulate nano output
         nano_output = "  GNU nano 6.2\n\n^G Get Help  ^O Write Out\n"
@@ -362,7 +362,7 @@ class TestModeInference:
 
         screen = pyte.Screen(100, 24)
         stream = pyte.Stream(screen)
-        manager._session_emulators[session_key] = (screen, stream)
+        manager.registry.emulators[session_key] = (screen, stream)
 
         # Simulate less pager at end
         pager_output = "Line 1\nLine 2\nLine 3\n(END)"
@@ -385,7 +385,7 @@ class TestModeInference:
 
         screen = pyte.Screen(100, 24)
         stream = pyte.Stream(screen)
-        manager._session_emulators[session_key] = (screen, stream)
+        manager.registry.emulators[session_key] = (screen, stream)
 
         # Simulate less pager with : prompt
         pager_output = "Line 1\nLine 2\n:"
@@ -408,7 +408,7 @@ class TestModeInference:
 
         screen = pyte.Screen(100, 24)
         stream = pyte.Stream(screen)
-        manager._session_emulators[session_key] = (screen, stream)
+        manager.registry.emulators[session_key] = (screen, stream)
 
         # Simulate password prompt
         prompt_output = "[sudo] password for user:"
@@ -427,7 +427,7 @@ class TestModeInference:
         manager = SSHSessionManager()
 
         session_key = "test@localhost:22"
-        manager._session_modes[session_key] = "editor"
+        manager.registry.modes[session_key] = "editor"
 
         # Try to detect awaiting input (should return None for editor)
         result = manager._detect_awaiting_input("some output", session_key)
@@ -443,7 +443,7 @@ class TestModeInference:
         manager = SSHSessionManager()
 
         session_key = "test@localhost:22"
-        manager._session_modes[session_key] = "pager"
+        manager.registry.modes[session_key] = "pager"
 
         # Try to detect pager prompt
         result = manager._detect_awaiting_input("some output\n(END)", session_key)

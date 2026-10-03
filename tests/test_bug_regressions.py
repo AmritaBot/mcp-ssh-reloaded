@@ -109,8 +109,8 @@ def test_mikrotik_print_command_gets_without_paging_by_default(monkeypatch):
     monkeypatch.setenv("MCP_SSH_MIKROTIK_AUTO_WITHOUT_PAGING", "1")
     manager = SSHSessionManager()
     session_key = "u@h:22"
-    manager._session_shell_types[session_key] = "mikrotik"
-    manager._session_prompts[session_key] = "[u@router] >"
+    manager.registry.shell_types[session_key] = "mikrotik"
+    manager.registry.prompts[session_key] = "[u@router] >"
 
     rewritten = manager._maybe_rewrite_mikrotik_command(
         session_key, "/routing filter rule print where chain=main"
@@ -127,7 +127,7 @@ def test_mikrotik_auto_without_paging_can_be_disabled(monkeypatch):
     monkeypatch.setenv("MCP_SSH_MIKROTIK_AUTO_WITHOUT_PAGING", "0")
     manager = SSHSessionManager()
     session_key = "u@h:22"
-    manager._session_shell_types[session_key] = "mikrotik"
+    manager.registry.shell_types[session_key] = "mikrotik"
 
     original = "/routing filter rule print"
     assert manager._maybe_rewrite_mikrotik_command(session_key, original) == original
@@ -137,8 +137,8 @@ def test_mikrotik_no_rewrite_without_slash_or_menu_context(monkeypatch):
     monkeypatch.setenv("MCP_SSH_MIKROTIK_AUTO_WITHOUT_PAGING", "1")
     manager = SSHSessionManager()
     session_key = "u@h:22"
-    manager._session_shell_types[session_key] = "mikrotik"
-    manager._session_prompts[session_key] = "[u@router] >"
+    manager.registry.shell_types[session_key] = "mikrotik"
+    manager.registry.prompts[session_key] = "[u@router] >"
 
     original = "routing filter rule print"
     assert manager._maybe_rewrite_mikrotik_command(session_key, original) == original
@@ -148,8 +148,8 @@ def test_mikrotik_rewrite_in_menu_context_without_leading_slash(monkeypatch):
     monkeypatch.setenv("MCP_SSH_MIKROTIK_AUTO_WITHOUT_PAGING", "1")
     manager = SSHSessionManager()
     session_key = "u@h:22"
-    manager._session_shell_types[session_key] = "mikrotik"
-    manager._session_prompts[session_key] = "[u@router] /routing/filter/rule>"
+    manager.registry.shell_types[session_key] = "mikrotik"
+    manager.registry.prompts[session_key] = "[u@router] /routing/filter/rule>"
 
     rewritten = manager._maybe_rewrite_mikrotik_command(session_key, "print detail")
     assert rewritten == "print detail without-paging"
@@ -297,3 +297,46 @@ def test_package_manager_remove_commands_start_async_immediately():
         assert CommandExecutor._should_start_async_immediately(cmd), (
             f"{cmd} should start async immediately"
         )
+
+
+class _FakeShell:
+    """Minimal shell stand-in: records what was sent."""
+
+    def __init__(self):
+        self.sent: list[bytes] = []
+
+    def send(self, data: bytes) -> int:
+        self.sent.append(data)
+        return len(data)
+
+
+def test_interrupt_signals_the_worker_to_stop():
+    """interrupt_command_by_id must set monitoring_cancelled.
+
+    Regression guard: it used to only flip the status, so the worker kept
+    reading the channel and starved every following command.
+    """
+    manager = SSHSessionManager()
+    executor = manager.command_executor
+    shell = _FakeShell()
+    cmd = RunningCommand(
+        command_id="interrupt-guard",
+        session_key="root@example:22",
+        command="sleep 999",
+        shell=shell,  # type: ignore[arg-type]
+        future=None,
+        status=CommandStatus.RUNNING,
+        stdout="",
+        stderr="",
+        exit_code=None,
+        start_time=datetime.now(),
+        end_time=None,
+    )
+    executor._commands["interrupt-guard"] = cmd
+
+    ok, message = executor.interrupt_command_by_id("interrupt-guard")
+
+    assert ok, message
+    assert shell.sent == [b"\x03"]
+    assert cmd.monitoring_cancelled.is_set()
+    assert cmd.status == CommandStatus.INTERRUPTED

@@ -104,11 +104,11 @@ def streaming_manager(mock_ssh_client):
     user = os.getenv("SSH_TEST_USER", "jon")
     port = int(os.getenv("SSH_TEST_PORT", "22"))
     session_key = f"{user}@{host}:{port}"
-    manager._session_shell_types[session_key] = "mikrotik"
-    manager._session_prompts[session_key] = "[jon@MikroTik] >"
+    manager.registry.shell_types[session_key] = "mikrotik"
+    manager.registry.prompts[session_key] = "[jon@MikroTik] >"
     shell = mock_ssh_client.invoke_shell.return_value
 
-    def fake_streaming_execute(client, command, timeout, skey):
+    def fake_streaming_execute(client, command, timeout, skey, **kwargs):
         return f"[streaming start] {command}\n", "", 124, None, None
 
     with (
@@ -142,15 +142,15 @@ def test_mikrotik_pager_handling_mock(mock_ssh_client):
     port = int(os.getenv("SSH_TEST_PORT", "22"))
     manager = SSHSessionManager()
     session_key = f"{user}@{host}:{port}"
-    manager._sessions[session_key] = mock_ssh_client
-    manager._session_shell_types[session_key] = "mikrotik"
+    manager.registry.sessions[session_key] = mock_ssh_client
+    manager.registry.shell_types[session_key] = "mikrotik"
 
     with patch.object(
         manager.connection,
         "resolve_connection",
         return_value=({}, host, user, port, session_key),
     ):
-        manager._session_prompts[session_key] = "[jon@MikroTik] >"
+        manager.registry.prompts[session_key] = "[jon@MikroTik] >"
         command = "/interface bridge port print"
         stdout, _stderr, exit_code = asyncio.run(
             manager.execute_command(host=host, command=command, timeout=15)

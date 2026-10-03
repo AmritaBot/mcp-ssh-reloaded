@@ -27,9 +27,7 @@ if TYPE_CHECKING:
     import paramiko
 
 
-# ---------------------------------------------------------------------------
 # Identity & connection
-# ---------------------------------------------------------------------------
 
 
 class DeviceFamily(Enum):
@@ -92,9 +90,7 @@ class ConnectionParams:
         return ConnectionParams(**d)
 
 
-# ---------------------------------------------------------------------------
 # Execution results
-# ---------------------------------------------------------------------------
 
 
 class CommandStatus(Enum):
@@ -117,6 +113,7 @@ class CommandResult:
     command_id: str | None = None
     duration_ms: float = 0.0
     truncated: bool = False
+    spilled_path: str | None = None
 
 
 @dataclass
@@ -129,9 +126,7 @@ class FileContent:
     max_bytes: int = 0
 
 
-# ---------------------------------------------------------------------------
 # Session lifecycle
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -201,6 +196,8 @@ class RunningCommand:
     streaming_mode: bool = False
     last_output_time: datetime | None = None
     output_chunks: list[str] = field(default_factory=list)  # For streaming mode
+    truncated: bool = False  # Output hit the cap; stdout is head+tail only
+    spilled_path: str | None = None  # Where the full stream was written
 
 
 @dataclass
@@ -221,9 +218,7 @@ class ConnectionProfile:
     connection_health: str = "unknown"  # "healthy", "degraded", "dead"
 
 
-# ---------------------------------------------------------------------------
 # Server config
-# ---------------------------------------------------------------------------
 
 
 class ServerConfig(BaseSettings):
@@ -264,9 +259,7 @@ class ServerConfig(BaseSettings):
     async_default_timeout: int = 30
 
 
-# ---------------------------------------------------------------------------
 # Error types
-# ---------------------------------------------------------------------------
 
 
 class ErrorCategory(Enum):
