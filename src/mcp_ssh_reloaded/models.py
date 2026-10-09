@@ -120,19 +120,22 @@ class CommandResult:
 class FileContent:
     """Result of a remote file read.
 
-    When ``truncated`` is set the window covers lines ``start_line``..``end_line``
-    and can be resumed by passing ``next_start_line`` as the next ``start_line``.
+    ``content`` is always valid text: a byte-capped read is trimmed back to a
+    character boundary, and a line window ends on a line boundary.  Resume a
+    truncated read with ``next_offset`` (bytes) or ``next_start_line`` (lines).
     """
 
     content: str = ""
     path: str = ""
     truncated: bool = False
     max_bytes: int = 0
-    start_line: int = 1
-    end_line: int = 0
+    bytes_read: int = 0
+    offset: int = 0
+    next_offset: int | None = None
+    start_line: int | None = None
+    end_line: int | None = None
     total_lines: int | None = None
     next_start_line: int | None = None
-    bytes_read: int = 0
     error: str | None = None
 
 

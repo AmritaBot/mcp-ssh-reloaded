@@ -39,31 +39,55 @@ class FileManager:
         encoding: str = "utf-8",
         errors: str = "replace",
         max_bytes: int | None = None,
-        start_line: int = 1,
-        max_lines: int | None = None,
         sudo_password: str | None = None,
         use_sudo: bool = False,
         timeout: int = 30,
+        *,
+        start_line: int = 1,
+        offset: int = 0,
     ) -> FileContent:
         """Read a remote file over SSH using SFTP, with optional sudo fallback.
 
-        The result is always cut on a line boundary, so a truncated read never
-        splits a UTF-8 character; pass the reported ``next_start_line`` back as
-        ``start_line`` to fetch the next chunk.
+        A read returns at most ``max_bytes`` bytes.  ``offset`` starts it at that
+        byte position; ``start_line`` starts it at that 1-based line and makes
+        every window end on a line boundary.  A truncated result carries
+        ``next_offset`` (always) and ``next_start_line`` (line windows) so the
+        read can be resumed without skipping or repeating content.
         """
         logger = self.logger.getChild("read_file")
         logger.info(
             f"Reading remote file on {host}: {remote_path} "
-            f"(start_line={start_line}, max_lines={max_lines})"
+            f"(start_line={start_line}, offset={offset})"
         )
 
         if not remote_path:
             logger.error("Remote path must be provided.")
             return FileContent(error="Remote path must be provided")
+        if max_bytes is not None and max_bytes <= 0:
+            return FileContent(
+                path=remote_path, error="max_bytes must be a positive integer"
+            )
+        if offset < 0:
+            return FileContent(path=remote_path, error="offset must not be negative")
+        if start_line < 1:
+            return FileContent(path=remote_path, error="start_line must be >= 1")
+        if offset > 0 and start_line > 1:
+            return FileContent(
+                path=remote_path, error="Pass either offset or start_line, not both"
+            )
 
-        start_line = max(1, start_line)
-        if max_lines is not None and max_lines < 1:
-            max_lines = None
+        used_encoding = encoding or "utf-8"
+        used_errors = errors or "replace"
+        # Line windows only make sense when a newline is a single 0x0A byte.
+        line_mode = offset == 0 and _newline_is_single_byte(used_encoding)
+        if start_line > 1 and not line_mode:
+            return FileContent(
+                path=remote_path,
+                error=(
+                    "Line-based reads require a newline-compatible encoding; "
+                    "use offset/max_bytes for this encoding"
+                ),
+            )
 
         if not sudo_password and use_sudo:
             sudo_password = os.getenv(f"OVRD_{host}_SUDO_PASS")
@@ -79,9 +103,6 @@ class FileManager:
         if max_bytes is not None:
             byte_limit = min(max_bytes, self._session_manager.MAX_FILE_TRANSFER_SIZE)
         logger.debug(f"Byte limit set to {byte_limit}")
-
-        used_encoding = encoding or "utf-8"
-        used_errors = errors or "replace"
 
         sftp = None
         permission_denied = False
@@ -102,27 +123,25 @@ class FileManager:
                 )
 
             with sftp.file(resolved_path, "rb") as remote_file:
-                window = self._read_window(
-                    remote_file,
-                    start_line=start_line,
-                    max_lines=max_lines,
-                    byte_limit=byte_limit,
-                    encoding=used_encoding,
-                    errors=used_errors,
-                )
+                if line_mode:
+                    window = self._read_line_window(
+                        remote_file,
+                        start_line=start_line,
+                        byte_limit=byte_limit,
+                        encoding=used_encoding,
+                        errors=used_errors,
+                    )
+                else:
+                    window = self._read_byte_window(
+                        remote_file,
+                        offset=offset,
+                        byte_limit=byte_limit,
+                        encoding=used_encoding,
+                        errors=used_errors,
+                    )
 
             logger.info(f"Successfully read file {resolved_path} via SFTP.")
-            return FileContent(
-                content=window.text,
-                path=resolved_path,
-                truncated=window.truncated,
-                max_bytes=byte_limit,
-                start_line=window.start_line,
-                end_line=window.end_line,
-                total_lines=window.total_lines,
-                next_start_line=window.next_start_line,
-                bytes_read=window.bytes_read,
-            )
+            return _to_file_content(window, resolved_path, byte_limit)
         except FileNotFoundError:
             logger.error(f"Remote file not found: {remote_path}")
             return FileContent(
@@ -165,7 +184,8 @@ class FileManager:
                 errors=used_errors,
                 byte_limit=byte_limit,
                 start_line=start_line,
-                max_lines=max_lines,
+                offset=offset,
+                line_mode=line_mode,
                 sudo_password=sudo_password,
                 timeout=timeout,
             )
@@ -379,57 +399,112 @@ class FileManager:
         logger.info(f"Successfully wrote file via sudo: {message}")
         return message, "", 0
 
-    def _read_window(
+    def _read_line_window(
         self,
         remote_file: paramiko.SFTPFile,
         *,
         start_line: int,
-        max_lines: int | None,
         byte_limit: int,
         encoding: str,
         errors: str,
-    ) -> _LineWindow:
-        """Stream lines into a byte-bounded, character-aligned window."""
-        kept: list[str] = []
+    ) -> _Window:
+        """Read whole lines from ``start_line`` until the byte budget runs out."""
+        kept: list[bytes] = []
         kept_bytes = 0
-        line_no = 0
+        consumed = 0
+        last_line = start_line - 1
+        seen_line = 0
         truncated = False
+        partial = False
 
-        for raw in self._iter_lines(remote_file):
-            line_no += 1
+        for line_no, raw, complete in self._iter_lines(
+            remote_file, max_line_bytes=byte_limit
+        ):
+            seen_line = line_no
             if line_no < start_line:
+                consumed += len(raw)
                 continue
-            if max_lines is not None and len(kept) >= max_lines:
-                truncated = True
-                break
             if kept_bytes + len(raw) > byte_limit:
-                room = byte_limit - kept_bytes
-                if room > 0:
-                    piece = _trim_partial_char(raw[:room], encoding, errors)
-                    kept.append(piece.decode(encoding, errors))
-                    kept_bytes += len(piece)
+                # A whole line never fits in the remaining budget: stop before it.
                 truncated = True
                 break
-            kept.append(raw.decode(encoding, errors))
+            kept.append(raw)
             kept_bytes += len(raw)
+            consumed += len(raw)
+            last_line = line_no
+            if not complete:
+                # Fragment of a physical line longer than the byte cap.
+                partial = True
+                truncated = True
+                break
 
-        end_line = start_line + len(kept) - 1 if kept else max(0, start_line - 1)
-        return _LineWindow(
-            text="".join(kept),
+        text = _trim_partial_char(b"".join(kept), encoding, errors).decode(
+            encoding, errors
+        )
+        if kept:
+            end_line = last_line
+        else:
+            end_line = max(0, min(start_line - 1, seen_line))
+        return _Window(
+            text=text,
             truncated=truncated,
+            bytes_read=kept_bytes,
+            offset=0,
+            next_offset=consumed if truncated else None,
             start_line=start_line,
             end_line=end_line,
-            total_lines=None if truncated else line_no,
-            next_start_line=end_line + 1 if truncated else None,
-            bytes_read=kept_bytes,
+            total_lines=None if truncated else seen_line,
+            # A partial line cannot be resumed by line number without looping.
+            next_start_line=last_line + 1 if truncated and not partial else None,
+        )
+
+    def _read_byte_window(
+        self,
+        remote_file: paramiko.SFTPFile,
+        *,
+        offset: int,
+        byte_limit: int,
+        encoding: str,
+        errors: str,
+    ) -> _Window:
+        """Read a byte window, trimmed back to a character boundary."""
+        if offset:
+            remote_file.seek(offset)
+        data = remote_file.read(byte_limit + 1)
+        truncated = len(data) > byte_limit
+        if truncated:
+            data = data[:byte_limit]
+        data = _trim_partial_char(data, encoding, errors)
+        text = data.decode(encoding, errors)
+        line_count = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
+        known = offset == 0
+        return _Window(
+            text=text,
+            truncated=truncated,
+            bytes_read=len(data),
+            offset=offset,
+            next_offset=offset + len(data) if truncated else None,
+            start_line=1 if known else None,
+            end_line=line_count if known else None,
+            total_lines=line_count if known and not truncated else None,
+            next_start_line=None,
         )
 
     def _iter_lines(
-        self, remote_file: paramiko.SFTPFile, chunk_size: int = 65536
-    ) -> Iterator[bytes]:
-        """Yield raw lines (newline kept) without buffering the whole file."""
+        self,
+        remote_file: paramiko.SFTPFile,
+        chunk_size: int = 65536,
+        max_line_bytes: int | None = None,
+    ) -> Iterator[tuple[int, bytes, bool]]:
+        """Yield ``(line_no, raw, complete)`` without buffering the whole file.
+
+        ``complete`` is False only for a fragment of a physical line longer than
+        ``max_line_bytes``; fragments keep the same ``line_no`` so they are never
+        mistaken for extra lines.
+        """
         buffer = b""
-        cap = self._session_manager.MAX_FILE_TRANSFER_SIZE
+        line_no = 0
+        in_partial = False
         while True:
             chunk = remote_file.read(chunk_size)
             if not chunk:
@@ -439,14 +514,21 @@ class FileManager:
                 idx = buffer.find(b"\n")
                 if idx < 0:
                     break
-                yield buffer[: idx + 1]
+                if not in_partial:
+                    line_no += 1
+                yield line_no, buffer[: idx + 1], True
+                in_partial = False
                 buffer = buffer[idx + 1 :]
-            # A binary file with no newlines must not grow the buffer forever.
-            if len(buffer) > cap:
-                yield buffer
-                buffer = b""
+            if max_line_bytes is not None and len(buffer) > max_line_bytes:
+                if not in_partial:
+                    line_no += 1
+                    in_partial = True
+                yield line_no, buffer[:max_line_bytes], False
+                buffer = buffer[max_line_bytes:]
         if buffer:
-            yield buffer
+            if not in_partial:
+                line_no += 1
+            yield line_no, buffer, True
 
     async def _read_via_sudo(
         self,
@@ -461,68 +543,100 @@ class FileManager:
         errors: str,
         byte_limit: int,
         start_line: int,
-        max_lines: int | None,
+        offset: int,
+        line_mode: bool,
         sudo_password: str | None,
         timeout: int,
     ) -> FileContent:
         """Read through ``sudo`` when SFTP is denied.
 
         The payload is base64-wrapped so the byte cap cannot split a character
-        on the wire, and ``sed`` selects the requested line window.
+        on the wire, and a leading ``sudo test -r`` guard makes an unreadable
+        file surface as an error instead of an empty success.
         """
         logger = self.logger.getChild("sudo_read")
-        last_line = start_line + max_lines - 1 if max_lines is not None else "$"
-        cmd = (
-            f"sudo sed -n '{start_line},{last_line}p' {shlex.quote(remote_path)} "
-            f"| head -c {byte_limit} | base64"
-        )
+        quoted = shlex.quote(remote_path)
+        if line_mode:
+            source = f"sudo sed -n '{start_line},$p' {quoted}"
+        else:
+            source = f"sudo tail -c +{offset + 1} {quoted}"
+        cmd = f"sudo test -r {quoted} && {source} | head -c {byte_limit + 1} | base64"
         logger.debug(f"Sudo fallback command: {cmd}")
 
-        stdout, stderr, exit_code = await self._session_manager.execute_command(
+        result = await self._session_manager.execute_result(
             host=host,
             username=username,
+            command=cmd,
             password=password,
             key_filename=key_filename,
             port=port,
-            command=cmd,
             sudo_password=sudo_password,
             timeout=timeout,
         )
-        if exit_code != 0:
-            logger.error(f"Sudo fallback failed for {remote_path}: {stderr}")
+        if result.exit_code != 0:
+            logger.error(f"Sudo fallback failed for {remote_path}: {result.stderr}")
             return FileContent(
-                path=remote_path, error=f"Permission denied and sudo failed: {stderr}"
+                path=remote_path,
+                error=f"Permission denied and sudo failed: {result.stderr}",
+            )
+        if result.truncated:
+            logger.error(f"Sudo output for {remote_path} exceeded the output cap.")
+            return FileContent(
+                path=remote_path,
+                error=(
+                    "Sudo read output exceeded the command output cap; "
+                    "reduce max_bytes"
+                ),
             )
 
         try:
-            raw = base64.b64decode(stdout, validate=False)
+            raw = base64.b64decode(result.stdout, validate=False)
         except Exception as e:
             logger.error(f"Failed to decode sudo output for {remote_path}: {e}")
             return FileContent(
                 path=remote_path, error=f"Failed to decode sudo output: {e!s}"
             )
 
-        truncated = len(raw) >= byte_limit
+        truncated = len(raw) > byte_limit
         if truncated:
-            raw = _trim_partial_char(raw[:byte_limit], encoding, errors)
-        content = raw.decode(encoding, errors)
-        num_lines = content.count("\n") + (
-            1 if content and not content.endswith("\n") else 0
-        )
-        end_line = start_line + num_lines - 1 if num_lines else max(0, start_line - 1)
+            raw = raw[:byte_limit]
+        if line_mode and truncated and not raw.endswith(b"\n"):
+            # Drop the partial trailing line so the window stays line-aligned.
+            idx = raw.rfind(b"\n")
+            raw = raw[: idx + 1] if idx >= 0 else b""
+        raw = _trim_partial_char(raw, encoding, errors)
+        text = raw.decode(encoding, errors)
+        line_count = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
+
+        if line_mode:
+            end_line = start_line + line_count - 1 if text else start_line - 1
+            window = _Window(
+                text=text,
+                truncated=truncated,
+                bytes_read=len(raw),
+                offset=0,
+                next_offset=None,
+                start_line=start_line,
+                end_line=end_line,
+                total_lines=None if truncated else end_line,
+                next_start_line=end_line + 1 if truncated and text else None,
+            )
+        else:
+            known = offset == 0
+            window = _Window(
+                text=text,
+                truncated=truncated,
+                bytes_read=len(raw),
+                offset=offset,
+                next_offset=offset + len(raw) if truncated else None,
+                start_line=1 if known else None,
+                end_line=line_count if known else None,
+                total_lines=line_count if known and not truncated else None,
+                next_start_line=None,
+            )
 
         logger.info(f"Successfully read file {remote_path} via sudo fallback.")
-        return FileContent(
-            content=content,
-            path=remote_path,
-            truncated=truncated,
-            max_bytes=byte_limit,
-            start_line=start_line,
-            end_line=end_line,
-            total_lines=None,
-            next_start_line=end_line + 1 if truncated else None,
-            bytes_read=len(raw),
-        )
+        return _to_file_content(window, remote_path, byte_limit)
 
     def _resolve_sftp_path(self, sftp: paramiko.SFTPClient, remote_path: str) -> str:
         """Resolve SFTP path, including '~' expansion."""
@@ -566,16 +680,43 @@ class FileManager:
 
 
 @dataclass
-class _LineWindow:
-    """Internal carrier for one bounded, line-aligned slice of a file."""
+class _Window:
+    """Internal carrier for one bounded, character-aligned slice of a file."""
 
     text: str
     truncated: bool
-    start_line: int
-    end_line: int
+    bytes_read: int
+    offset: int
+    next_offset: int | None
+    start_line: int | None
+    end_line: int | None
     total_lines: int | None
     next_start_line: int | None
-    bytes_read: int
+
+
+def _to_file_content(window: _Window, path: str, byte_limit: int) -> FileContent:
+    """Promote an internal window into the public :class:`FileContent`."""
+    return FileContent(
+        content=window.text,
+        path=path,
+        truncated=window.truncated,
+        max_bytes=byte_limit,
+        bytes_read=window.bytes_read,
+        offset=window.offset,
+        next_offset=window.next_offset,
+        start_line=window.start_line,
+        end_line=window.end_line,
+        total_lines=window.total_lines,
+        next_start_line=window.next_start_line,
+    )
+
+
+def _newline_is_single_byte(encoding: str) -> bool:
+    """True when a newline encodes to a single ``0x0A`` byte."""
+    try:
+        return "\n".encode(encoding) == b"\n"
+    except (LookupError, UnicodeError):
+        return False
 
 
 def _trim_partial_char(data: bytes, encoding: str, errors: str) -> bytes:

@@ -1337,11 +1337,12 @@ class SSHSessionManager:
         encoding: str = "utf-8",
         errors: str = "replace",
         max_bytes: int | None = None,
-        start_line: int = 1,
-        max_lines: int | None = None,
         sudo_password: str | None = None,
         use_sudo: bool = False,
         timeout: int = 30,
+        *,
+        start_line: int = 1,
+        offset: int = 0,
     ) -> FileContent:
         """Delegate remote file reads to the FileManager helper."""
         return await self.file_manager.read_file(
@@ -1354,11 +1355,11 @@ class SSHSessionManager:
             encoding=encoding,
             errors=errors,
             max_bytes=max_bytes,
-            start_line=start_line,
-            max_lines=max_lines,
             sudo_password=sudo_password,
             use_sudo=use_sudo,
             timeout=timeout,
+            start_line=start_line,
+            offset=offset,
         )
 
     async def write_file(

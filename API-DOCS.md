@@ -112,12 +112,20 @@ prod = conn.with_overrides(host="prod.example.com")
 
 ### `FileContent`
 
-| Field       | Type   | Description                   |
-| ----------- | ------ | ----------------------------- |
-| `content`   | `str`  | File contents (decoded)       |
-| `path`      | `str`  | Remote path                   |
-| `truncated` | `bool` | True if read was capped       |
-| `max_bytes` | `int`  | Read cap used (0 = unlimited) |
+| Field             | Type        | Description                                       |
+| ----------------- | ----------- | ------------------------------------------------- |
+| `content`         | `str`       | File contents (decoded, always character-aligned) |
+| `path`            | `str`       | Remote path                                       |
+| `truncated`       | `bool`      | True if the read was capped                       |
+| `max_bytes`       | `int`       | Read cap used (0 = unlimited)                     |
+| `bytes_read`      | `int`       | Bytes actually returned                           |
+| `offset`          | `int`       | Byte offset the window started at                 |
+| `next_offset`     | `int \| None` | Byte offset to resume from (truncated reads)      |
+| `start_line`      | `int \| None` | First line in the window (line reads only)        |
+| `end_line`        | `int \| None` | Last line in the window (line reads only)         |
+| `total_lines`     | `int \| None` | Total lines, when the whole file was read         |
+| `next_start_line` | `int \| None` | Line to resume from (line reads only)             |
+| `error`           | `str \| None` | Error detail when the read failed                 |
 
 ### `SessionInfo`
 
@@ -294,12 +302,27 @@ def read_file(
     *,
     encoding: str = "utf-8",
     max_bytes: int | None = None,
+    start_line: int = 1,
+    offset: int = 0,
     use_sudo: bool = False,
     timeout: int | None = None,
 ) -> FileContent
 ```
 
 Read a remote file. Falls back to `sudo cat` if SFTP lacks permissions. Returns `FileContent`.
+
+A read returns at most `max_bytes` bytes and is always trimmed back to a character
+boundary, so the decoded `content` is never split mid-character.
+
+- `start_line` starts the read at a 1-based line and makes every window end on a
+  line boundary; resume with `next_start_line` to continue without gaps or overlap.
+- `offset` starts the read at a byte position and is the cheap resume path for
+  large files; resume with `next_offset`.
+- `offset` and `start_line > 1` are mutually exclusive. Line windows need a
+  newline-compatible encoding (a newline must encode to a single `0x0A` byte).
+- The sudo fallback base64-wraps its payload, so the byte cap cannot split a
+  character on the wire, and a failed `sudo sed`/`sudo tail` is reported as an
+  error instead of empty content.
 
 ### `write_file`
 
@@ -443,7 +466,7 @@ When running `mcp-ssh-reloaded serve mcp`, the following tools are exposed to AI
 | `list_sessions`                | List active SSH sessions                     |
 | `close_session`                | Close a specific session                     |
 | `close_all_sessions`           | Close all sessions                           |
-| `read_file`                    | Read a remote file (SFTP with sudo fallback) |
+| `read_file`                    | Read a remote file (SFTP with sudo fallback; resumable windows) |
 | `write_file`                   | Write content to a remote file               |
 | `read_screen`                  | Capture PTY screen snapshot                  |
 | `send_keys`                    | Send keystrokes to PTY (vim, nano, etc.)     |

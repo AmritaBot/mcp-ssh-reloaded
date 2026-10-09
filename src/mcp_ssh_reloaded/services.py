@@ -159,11 +159,11 @@ class SSHService:
         encoding: str = "utf-8",
         max_bytes: int | None = None,
         start_line: int = 1,
-        max_lines: int | None = None,
+        offset: int = 0,
         use_sudo: bool = False,
         timeout: int | None = None,
     ) -> FileContent:
-        """Read a remote file, optionally a bounded window of its lines."""
+        """Read a remote file, optionally a resumable window of it."""
         fc = await self._engine.read_file(
             host=conn.host,
             remote_path=path,
@@ -175,7 +175,7 @@ class SSHService:
             errors="replace",
             max_bytes=max_bytes,
             start_line=start_line,
-            max_lines=max_lines,
+            offset=offset,
             sudo_password=conn.sudo_password if use_sudo else None,
             use_sudo=use_sudo,
             timeout=timeout or self.config.default_timeout,

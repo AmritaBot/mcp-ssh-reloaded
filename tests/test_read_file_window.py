@@ -1,13 +1,19 @@
 """read_file must stay UTF-8 safe, report one truncation notice, and resume."""
 
 import asyncio
+import base64
 import os
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from mcp_ssh_reloaded import ConnectionParams, ServerConfig
-from mcp_ssh_reloaded.file_manager import _trim_partial_char
+from mcp_ssh_reloaded.file_manager import (
+    FileManager,
+    _newline_is_single_byte,
+    _trim_partial_char,
+)
 from mcp_ssh_reloaded.services import SSHService
 from mcp_ssh_reloaded.session_diagnostics import (
     SessionDiagnosticsProvider,
@@ -24,8 +30,14 @@ def test_trim_partial_char_drops_incomplete_tail():
 
 
 def test_trim_partial_char_keeps_complete_data():
-    raw = b"abc"
-    assert _trim_partial_char(raw, "utf-8", "replace") == raw
+    assert _trim_partial_char(b"abc", "utf-8", "replace") == b"abc"
+
+
+def test_newline_compatibility_detection():
+    assert _newline_is_single_byte("utf-8")
+    assert _newline_is_single_byte("latin-1")
+    assert not _newline_is_single_byte("utf-16-le")
+    assert not _newline_is_single_byte("utf-16")
 
 
 def test_summarize_command_collapses_heredoc():
@@ -53,10 +65,85 @@ def test_recent_commands_are_summarized():
     assert "\n" not in recent[0]
 
 
+#  sudo fallback (mocked executor)
+
+
+def _sudo_manager(result):
+    manager = MagicMock()
+    manager.MAX_FILE_TRANSFER_SIZE = 2 * 1024 * 1024
+    manager.execute_result = AsyncMock(return_value=result)
+    return manager
+
+
+def _sudo_read(manager, **overrides):
+    kwargs = {
+        "host": "h",
+        "remote_path": "/root/secret",
+        "username": None,
+        "password": None,
+        "key_filename": None,
+        "port": None,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "byte_limit": 40,
+        "start_line": 1,
+        "offset": 0,
+        "line_mode": True,
+        "sudo_password": None,
+        "timeout": 30,
+    }
+    kwargs.update(overrides)
+    return asyncio.run(FileManager(manager)._read_via_sudo(**kwargs))
+
+
+def test_sudo_read_surfaces_failures():
+    manager = _sudo_manager(
+        SimpleNamespace(exit_code=1, stdout="", stderr="permission denied")
+    )
+    fc = _sudo_read(manager)
+    assert fc.error is not None
+    assert "sudo failed" in fc.error
+
+
+def test_sudo_read_rejects_truncated_output():
+    manager = _sudo_manager(
+        SimpleNamespace(exit_code=0, stdout="", stderr="", truncated=True)
+    )
+    fc = _sudo_read(manager)
+    assert fc.error is not None
+    assert "output cap" in fc.error
+
+
+def test_sudo_line_window_is_line_aligned_and_resumable():
+    payload = ("跳跃的狐狸跳来跳去 1\n跳跃的狐狸跳来跳去 2\n").encode()
+    manager = _sudo_manager(
+        SimpleNamespace(
+            exit_code=0,
+            stdout=base64.b64encode(payload).decode(),
+            stderr="",
+            truncated=False,
+        )
+    )
+    fc = _sudo_read(manager, byte_limit=40)
+    # 40 bytes cut inside the second line, which is dropped rather than split.
+    assert fc.truncated is True
+    assert "\ufffd" not in fc.content
+    assert fc.content == "跳跃的狐狸跳来跳去 1\n"
+    assert fc.start_line == 1
+    assert fc.end_line == 1
+    assert fc.next_start_line == 2
+
+
+#  real SSH (integration)
+
+
 requires_ssh = pytest.mark.skipif(
     not os.environ.get("SSH_TEST_HOST"),
     reason="Skipping integration test: SSH_TEST_HOST not set",
 )
+
+LINES = [f"跳跃的狐狸跳来跳去 {i}" for i in range(1, 21)]
+PAYLOAD = "\n".join(LINES) + "\n"
 
 
 def _conn() -> ConnectionParams:
@@ -69,23 +156,25 @@ def _conn() -> ConnectionParams:
     )
 
 
+def _service() -> SSHService:
+    return SSHService(config=ServerConfig(max_file_bytes=200000))
+
+
 @requires_ssh
-def test_read_file_window_is_utf8_safe_and_resumable():
-    service = SSHService(config=ServerConfig(max_file_bytes=200000))
+def test_line_window_is_resumable_without_gaps():
+    service = _service()
     conn = _conn()
-    lines = [f"跳跃的狐狸跳来跳去 {i}" for i in range(1, 21)]
-    payload = "\n".join(lines) + "\n"
     remote = "/tmp/mcp_ssh_read_window_test.txt"
 
     async def run():
         try:
-            await service.write_file(conn, remote, payload)
-            first = await service.read_file(conn, remote, max_bytes=60)
+            await service.write_file(conn, remote, PAYLOAD)
+            first = await service.read_file(conn, remote, max_bytes=45)
             assert first.next_start_line is not None
             second = await service.read_file(
-                conn, remote, start_line=first.next_start_line, max_lines=5
+                conn, remote, max_bytes=45, start_line=first.next_start_line
             )
-            whole = await service.read_file(conn, remote, max_lines=100)
+            whole = await service.read_file(conn, remote, max_bytes=200000)
             return first, second, whole
         finally:
             await service.execute(conn, f"rm -f {remote}")
@@ -93,15 +182,44 @@ def test_read_file_window_is_utf8_safe_and_resumable():
 
     first, second, whole = asyncio.run(run())
 
+    # A line window returns whole lines only, so nothing is ever split.
     assert first.truncated is True
     assert "\ufffd" not in first.content
-    assert "CONTENT TRUNCATED" not in first.content
-    assert first.next_start_line == first.end_line + 1
-    assert second.start_line == first.next_start_line
-    assert "\ufffd" not in second.content
+    assert first.content == LINES[0] + "\n"
+    assert first.start_line == 1
+    assert first.end_line == 1
+    assert first.next_start_line == 2
+    assert first.next_offset == len((LINES[0] + "\n").encode())
+    # The resumed window starts exactly where the first one stopped.
+    assert second.start_line == 2
+    assert second.content == LINES[1] + "\n"
+    # A window wide enough for the whole file reports the full content.
     assert whole.truncated is False
-    assert whole.total_lines == len(lines)
-    assert whole.content == payload
+    assert whole.total_lines == len(LINES)
+    assert whole.content == PAYLOAD
+
+
+@requires_ssh
+def test_byte_window_never_splits_a_character():
+    service = _service()
+    conn = _conn()
+    remote = "/tmp/mcp_ssh_read_byte_test.txt"
+
+    async def run():
+        try:
+            await service.write_file(conn, remote, "跳跃的狐狸跳来跳去\n")
+            # Start one character in and cut inside the following character.
+            return await service.read_file(conn, remote, offset=3, max_bytes=7)
+        finally:
+            await service.execute(conn, f"rm -f {remote}")
+            await service.close_all()
+
+    window = asyncio.run(run())
+
+    assert "\ufffd" not in window.content
+    assert window.content == "跃的"
+    assert window.truncated is True
+    assert window.next_offset == 9
 
 
 @requires_ssh
@@ -113,7 +231,7 @@ def test_read_file_tool_renders_one_truncation_notice():
     payload = "跳跃的狐狸跳来跳去\n" * 40
 
     async def run():
-        service = SSHService(config=ServerConfig(max_file_bytes=200000))
+        service = _service()
         try:
             await service.write_file(conn, remote, payload)
             return await server.read_file(
