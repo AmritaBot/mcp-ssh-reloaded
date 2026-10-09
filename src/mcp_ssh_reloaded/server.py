@@ -162,10 +162,16 @@ async def read_file(
     encoding: str = "utf-8",
     errors: str = "replace",
     max_bytes: int | None = None,
+    start_line: int = 1,
+    max_lines: int | None = None,
     sudo_password: str | None = None,
     use_sudo: bool = False,
 ) -> str:
-    """Read a remote file over SSH. Falls back to sudo cat if permission denied."""
+    """Read a remote file over SSH. Falls back to sudo cat if permission denied.
+
+    Returns at most ``max_bytes`` bytes, cut on a line boundary.  A truncated
+    result reports the line range and the ``start_line`` to resume from.
+    """
     try:
         fc = await _service().read_file(
             ConnectionParams(
@@ -179,11 +185,21 @@ async def read_file(
             remote_path,
             encoding=encoding,
             max_bytes=max_bytes,
+            start_line=start_line,
+            max_lines=max_lines,
             use_sudo=use_sudo,
         )
         result = "Exit Status: 0\n\nCONTENT:\n" + fc.content
         if fc.truncated:
-            result += f"\n\n[CONTENT TRUNCATED after {fc.max_bytes} bytes]"
+            result += (
+                f"\n\n[CONTENT TRUNCATED after {fc.bytes_read} bytes; "
+                f"showing lines {fc.start_line}-{fc.end_line}"
+            )
+            if fc.total_lines is not None:
+                result += f" of {fc.total_lines}"
+            if fc.next_start_line is not None:
+                result += f"; continue with start_line={fc.next_start_line}"
+            result += "]"
         return result
     except Exception as e:
         return _fmt_error(e)
@@ -462,7 +478,8 @@ async def get_session_diagnostics(
         if diag.last_activity:
             lines.append(f"⏰ Last Activity: {diag.last_activity}")
         if diag.command_history:
-            lines.append("📚 Recent: " + ", ".join(diag.command_history[-5:]))
+            recent = " | ".join(diag.command_history[-5:])
+            lines.append(f"📚 Recent ({len(diag.command_history)}): {recent}")
         return "\n".join(lines)
     except Exception as e:
         return _fmt_error(e)

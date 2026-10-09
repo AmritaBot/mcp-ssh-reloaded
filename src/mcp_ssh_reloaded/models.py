@@ -118,12 +118,22 @@ class CommandResult:
 
 @dataclass
 class FileContent:
-    """Result of a remote file read."""
+    """Result of a remote file read.
 
-    content: str
-    path: str
+    When ``truncated`` is set the window covers lines ``start_line``..``end_line``
+    and can be resumed by passing ``next_start_line`` as the next ``start_line``.
+    """
+
+    content: str = ""
+    path: str = ""
     truncated: bool = False
     max_bytes: int = 0
+    start_line: int = 1
+    end_line: int = 0
+    total_lines: int | None = None
+    next_start_line: int | None = None
+    bytes_read: int = 0
+    error: str | None = None
 
 
 # Session lifecycle
