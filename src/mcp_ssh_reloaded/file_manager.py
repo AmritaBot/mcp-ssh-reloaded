@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import base64
+import codecs
 import logging
 import os
 import posixpath
 import shlex
 import stat
+from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import paramiko
+
+from .models import FileContent
 
 if TYPE_CHECKING:
     from mcp_ssh_reloaded.session_manager import SSHSessionManager
@@ -37,16 +42,53 @@ class FileManager:
         sudo_password: str | None = None,
         use_sudo: bool = False,
         timeout: int = 30,
-    ) -> tuple[str, str, int]:
-        """Read a remote file over SSH using SFTP, with optional sudo fallback."""
+        *,
+        start_line: int = 1,
+        offset: int = 0,
+    ) -> FileContent:
+        """Read a remote file over SSH using SFTP, with optional sudo fallback.
+
+        A read returns at most ``max_bytes`` bytes.  ``offset`` starts it at that
+        byte position; ``start_line`` starts it at that 1-based line and makes
+        every window end on a line boundary.  A truncated result carries
+        ``next_offset`` (always) and ``next_start_line`` (line windows) so the
+        read can be resumed without skipping or repeating content.
+        """
         logger = self.logger.getChild("read_file")
-        logger.info(f"Reading remote file on {host}: {remote_path}")
+        logger.info(
+            f"Reading remote file on {host}: {remote_path} "
+            f"(start_line={start_line}, offset={offset})"
+        )
 
         if not remote_path:
             logger.error("Remote path must be provided.")
-            return "", "Remote path must be provided", 1
+            return FileContent(error="Remote path must be provided")
+        if max_bytes is not None and max_bytes <= 0:
+            return FileContent(
+                path=remote_path, error="max_bytes must be a positive integer"
+            )
+        if offset < 0:
+            return FileContent(path=remote_path, error="offset must not be negative")
+        if start_line < 1:
+            return FileContent(path=remote_path, error="start_line must be >= 1")
+        if offset > 0 and start_line > 1:
+            return FileContent(
+                path=remote_path, error="Pass either offset or start_line, not both"
+            )
 
-        # Apply environment variable override for sudo password
+        used_encoding = encoding or "utf-8"
+        used_errors = errors or "replace"
+        # Line windows only make sense when a newline is a single 0x0A byte.
+        line_mode = offset == 0 and _newline_is_single_byte(used_encoding)
+        if start_line > 1 and not line_mode:
+            return FileContent(
+                path=remote_path,
+                error=(
+                    "Line-based reads require a newline-compatible encoding; "
+                    "use offset/max_bytes for this encoding"
+                ),
+            )
+
         if not sudo_password and use_sudo:
             sudo_password = os.getenv(f"OVRD_{host}_SUDO_PASS")
 
@@ -62,10 +104,6 @@ class FileManager:
             byte_limit = min(max_bytes, self._session_manager.MAX_FILE_TRANSFER_SIZE)
         logger.debug(f"Byte limit set to {byte_limit}")
 
-        used_encoding = encoding or "utf-8"
-        used_errors = errors or "replace"
-
-        # Try SFTP first
         sftp = None
         permission_denied = False
         try:
@@ -79,39 +117,36 @@ class FileManager:
                 )
             if stat.S_ISDIR(attrs.st_mode):
                 logger.error(f"Remote path is a directory: {resolved_path}")
-                return "", f"Remote path is a directory: {resolved_path}", 1
+                return FileContent(
+                    path=resolved_path,
+                    error=f"Remote path is a directory: {resolved_path}",
+                )
 
             with sftp.file(resolved_path, "rb") as remote_file:
-                data = remote_file.read(byte_limit + 1)
-            logger.debug(f"Read {len(data)} bytes via SFTP.")
-
-            truncated = len(data) > byte_limit
-            if truncated:
-                data = data[:byte_limit]
-                logger.warning(f"File content truncated to {byte_limit} bytes.")
-
-            try:
-                content = data.decode(used_encoding, used_errors)
-            except UnicodeDecodeError as e:
-                logger.error(
-                    f"Decode error reading file {resolved_path} on {session_key}: {e!s}"
-                )
-                return (
-                    "",
-                    f"Failed to decode file using encoding '{used_encoding}': {e!s}",
-                    1,
-                )
-
-            stderr_msg = ""
-            if truncated:
-                stderr_msg = f"Content truncated to {byte_limit} bytes. Increase max_bytes to retrieve full file."
-                content += f"\n\n[CONTENT TRUNCATED after {byte_limit} bytes]"
+                if line_mode:
+                    window = self._read_line_window(
+                        remote_file,
+                        start_line=start_line,
+                        byte_limit=byte_limit,
+                        encoding=used_encoding,
+                        errors=used_errors,
+                    )
+                else:
+                    window = self._read_byte_window(
+                        remote_file,
+                        offset=offset,
+                        byte_limit=byte_limit,
+                        encoding=used_encoding,
+                        errors=used_errors,
+                    )
 
             logger.info(f"Successfully read file {resolved_path} via SFTP.")
-            return content, stderr_msg, 0
+            return _to_file_content(window, resolved_path, byte_limit)
         except FileNotFoundError:
             logger.error(f"Remote file not found: {remote_path}")
-            return "", f"Remote file not found: {remote_path}", 1
+            return FileContent(
+                path=remote_path, error=f"Remote file not found: {remote_path}"
+            )
         except PermissionError:
             logger.warning(f"SFTP permission denied for {remote_path}.")
             permission_denied = True
@@ -124,7 +159,9 @@ class FileManager:
                     f"Error reading file {remote_path} on {session_key}: {e!s}",
                     exc_info=True,
                 )
-                return "", f"Error reading remote file: {e!s}", 1
+                return FileContent(
+                    path=remote_path, error=f"Error reading remote file: {e!s}"
+                )
         finally:
             if sftp:
                 try:
@@ -132,63 +169,40 @@ class FileManager:
                 except Exception:
                     pass
 
-        # Fallback to sudo if permission denied and use_sudo or sudo_password provided
         if permission_denied and (use_sudo or sudo_password):
             logger.info(
                 f"SFTP permission denied, falling back to sudo cat for {remote_path}"
             )
-            # Use head to limit output size
-            cmd = f"sudo cat {shlex.quote(remote_path)} | head -c {byte_limit}"
-            logger.debug(f"Sudo fallback command: {cmd}")
-
-            if sudo_password:
-                stdout, stderr, exit_code = await self._session_manager.execute_command(
-                    host=host,
-                    username=username,
-                    password=password,
-                    key_filename=key_filename,
-                    port=port,
-                    command=cmd,
-                    sudo_password=sudo_password,
-                    timeout=timeout,
-                )
-            else:
-                stdout, stderr, exit_code = await self._session_manager.execute_command(
-                    host=host,
-                    username=username,
-                    password=password,
-                    key_filename=key_filename,
-                    port=port,
-                    command=cmd,
-                    timeout=timeout,
-                )
-
-            if exit_code != 0:
-                logger.error(f"Sudo fallback failed for {remote_path}: {stderr}")
-                return "", f"Permission denied and sudo failed: {stderr}", exit_code
-
-            # Check if output was truncated
-            truncated = len(stdout.encode("utf-8")) >= byte_limit
-            if truncated:
-                stdout += f"\n\n[CONTENT TRUNCATED after {byte_limit} bytes]"
-                stderr_msg = f"Content truncated to {byte_limit} bytes. Increase max_bytes to retrieve full file."
-            else:
-                stderr_msg = ""
-
-            logger.info(f"Successfully read file {remote_path} via sudo fallback.")
-            return stdout, stderr_msg, 0
-        elif permission_denied:
+            return await self._read_via_sudo(
+                host=host,
+                remote_path=remote_path,
+                username=username,
+                password=password,
+                key_filename=key_filename,
+                port=port,
+                encoding=used_encoding,
+                errors=used_errors,
+                byte_limit=byte_limit,
+                start_line=start_line,
+                offset=offset,
+                line_mode=line_mode,
+                sudo_password=sudo_password,
+                timeout=timeout,
+            )
+        if permission_denied:
             logger.error(
                 f"Permission denied reading {remote_path} and no sudo fallback specified."
             )
-            return (
-                "",
-                "Permission denied reading file. Set use_sudo=True or provide sudo_password to retry with sudo.",
-                1,
+            return FileContent(
+                path=remote_path,
+                error=(
+                    "Permission denied reading file. Set use_sudo=True or provide "
+                    "sudo_password to retry with sudo."
+                ),
             )
 
         logger.error("Unexpected error in read_file logic.")
-        return "", "Unexpected error in read_file", 1
+        return FileContent(path=remote_path, error="Unexpected error in read_file")
 
     async def write_file(
         self,
@@ -385,6 +399,245 @@ class FileManager:
         logger.info(f"Successfully wrote file via sudo: {message}")
         return message, "", 0
 
+    def _read_line_window(
+        self,
+        remote_file: paramiko.SFTPFile,
+        *,
+        start_line: int,
+        byte_limit: int,
+        encoding: str,
+        errors: str,
+    ) -> _Window:
+        """Read whole lines from ``start_line`` until the byte budget runs out."""
+        kept: list[bytes] = []
+        kept_bytes = 0
+        consumed = 0
+        last_line = start_line - 1
+        seen_line = 0
+        truncated = False
+        partial = False
+
+        for line_no, raw, complete in self._iter_lines(
+            remote_file, max_line_bytes=byte_limit
+        ):
+            seen_line = line_no
+            if line_no < start_line:
+                consumed += len(raw)
+                continue
+            if kept_bytes + len(raw) > byte_limit:
+                # A whole line never fits in the remaining budget: stop before it.
+                truncated = True
+                break
+            kept.append(raw)
+            kept_bytes += len(raw)
+            consumed += len(raw)
+            last_line = line_no
+            if not complete:
+                # Fragment of a physical line longer than the byte cap.
+                partial = True
+                truncated = True
+                break
+
+        text = _trim_partial_char(b"".join(kept), encoding, errors).decode(
+            encoding, errors
+        )
+        if kept:
+            end_line = last_line
+        else:
+            end_line = max(0, min(start_line - 1, seen_line))
+        return _Window(
+            text=text,
+            truncated=truncated,
+            bytes_read=kept_bytes,
+            offset=0,
+            next_offset=consumed if truncated else None,
+            start_line=start_line,
+            end_line=end_line,
+            total_lines=None if truncated else seen_line,
+            # A partial line cannot be resumed by line number without looping.
+            next_start_line=last_line + 1 if truncated and not partial else None,
+        )
+
+    def _read_byte_window(
+        self,
+        remote_file: paramiko.SFTPFile,
+        *,
+        offset: int,
+        byte_limit: int,
+        encoding: str,
+        errors: str,
+    ) -> _Window:
+        """Read a byte window, trimmed back to a character boundary."""
+        if offset:
+            remote_file.seek(offset)
+        data = remote_file.read(byte_limit + 1)
+        truncated = len(data) > byte_limit
+        if truncated:
+            data = data[:byte_limit]
+        data = _trim_partial_char(data, encoding, errors)
+        text = data.decode(encoding, errors)
+        line_count = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
+        known = offset == 0
+        return _Window(
+            text=text,
+            truncated=truncated,
+            bytes_read=len(data),
+            offset=offset,
+            next_offset=offset + len(data) if truncated else None,
+            start_line=1 if known else None,
+            end_line=line_count if known else None,
+            total_lines=line_count if known and not truncated else None,
+            next_start_line=None,
+        )
+
+    def _iter_lines(
+        self,
+        remote_file: paramiko.SFTPFile,
+        chunk_size: int = 65536,
+        max_line_bytes: int | None = None,
+    ) -> Iterator[tuple[int, bytes, bool]]:
+        """Yield ``(line_no, raw, complete)`` without buffering the whole file.
+
+        ``complete`` is False only for a fragment of a physical line longer than
+        ``max_line_bytes``; fragments keep the same ``line_no`` so they are never
+        mistaken for extra lines.
+        """
+        buffer = b""
+        line_no = 0
+        in_partial = False
+        while True:
+            chunk = remote_file.read(chunk_size)
+            if not chunk:
+                break
+            buffer += chunk
+            while True:
+                idx = buffer.find(b"\n")
+                if idx < 0:
+                    break
+                if not in_partial:
+                    line_no += 1
+                yield line_no, buffer[: idx + 1], True
+                in_partial = False
+                buffer = buffer[idx + 1 :]
+            if max_line_bytes is not None and len(buffer) > max_line_bytes:
+                if not in_partial:
+                    line_no += 1
+                    in_partial = True
+                yield line_no, buffer[:max_line_bytes], False
+                buffer = buffer[max_line_bytes:]
+        if buffer:
+            if not in_partial:
+                line_no += 1
+            yield line_no, buffer, True
+
+    async def _read_via_sudo(
+        self,
+        *,
+        host: str,
+        remote_path: str,
+        username: str | None,
+        password: str | None,
+        key_filename: str | None,
+        port: int | None,
+        encoding: str,
+        errors: str,
+        byte_limit: int,
+        start_line: int,
+        offset: int,
+        line_mode: bool,
+        sudo_password: str | None,
+        timeout: int,
+    ) -> FileContent:
+        """Read through ``sudo`` when SFTP is denied.
+
+        The payload is base64-wrapped so the byte cap cannot split a character
+        on the wire, and a leading ``sudo test -r`` guard makes an unreadable
+        file surface as an error instead of an empty success.
+        """
+        logger = self.logger.getChild("sudo_read")
+        quoted = shlex.quote(remote_path)
+        if line_mode:
+            source = f"sudo sed -n '{start_line},$p' {quoted}"
+        else:
+            source = f"sudo tail -c +{offset + 1} {quoted}"
+        cmd = f"sudo test -r {quoted} && {source} | head -c {byte_limit + 1} | base64"
+        logger.debug(f"Sudo fallback command: {cmd}")
+
+        result = await self._session_manager.execute_result(
+            host=host,
+            username=username,
+            command=cmd,
+            password=password,
+            key_filename=key_filename,
+            port=port,
+            sudo_password=sudo_password,
+            timeout=timeout,
+        )
+        if result.exit_code != 0:
+            logger.error(f"Sudo fallback failed for {remote_path}: {result.stderr}")
+            return FileContent(
+                path=remote_path,
+                error=f"Permission denied and sudo failed: {result.stderr}",
+            )
+        if result.truncated:
+            logger.error(f"Sudo output for {remote_path} exceeded the output cap.")
+            return FileContent(
+                path=remote_path,
+                error=(
+                    "Sudo read output exceeded the command output cap; "
+                    "reduce max_bytes"
+                ),
+            )
+
+        try:
+            raw = base64.b64decode(result.stdout, validate=False)
+        except Exception as e:
+            logger.error(f"Failed to decode sudo output for {remote_path}: {e}")
+            return FileContent(
+                path=remote_path, error=f"Failed to decode sudo output: {e!s}"
+            )
+
+        truncated = len(raw) > byte_limit
+        if truncated:
+            raw = raw[:byte_limit]
+        if line_mode and truncated and not raw.endswith(b"\n"):
+            # Drop the partial trailing line so the window stays line-aligned.
+            idx = raw.rfind(b"\n")
+            raw = raw[: idx + 1] if idx >= 0 else b""
+        raw = _trim_partial_char(raw, encoding, errors)
+        text = raw.decode(encoding, errors)
+        line_count = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
+
+        if line_mode:
+            end_line = start_line + line_count - 1 if text else start_line - 1
+            window = _Window(
+                text=text,
+                truncated=truncated,
+                bytes_read=len(raw),
+                offset=0,
+                next_offset=None,
+                start_line=start_line,
+                end_line=end_line,
+                total_lines=None if truncated else end_line,
+                next_start_line=end_line + 1 if truncated and text else None,
+            )
+        else:
+            known = offset == 0
+            window = _Window(
+                text=text,
+                truncated=truncated,
+                bytes_read=len(raw),
+                offset=offset,
+                next_offset=offset + len(raw) if truncated else None,
+                start_line=1 if known else None,
+                end_line=line_count if known else None,
+                total_lines=line_count if known and not truncated else None,
+                next_start_line=None,
+            )
+
+        logger.info(f"Successfully read file {remote_path} via sudo fallback.")
+        return _to_file_content(window, remote_path, byte_limit)
+
     def _resolve_sftp_path(self, sftp: paramiko.SFTPClient, remote_path: str) -> str:
         """Resolve SFTP path, including '~' expansion."""
         if remote_path == "~":
@@ -424,3 +677,56 @@ class FileManager:
             except FileNotFoundError:  # noqa: PERF203
                 logger.info(f"Creating remote directory: {directory}")
                 sftp.mkdir(directory)
+
+
+@dataclass
+class _Window:
+    """Internal carrier for one bounded, character-aligned slice of a file."""
+
+    text: str
+    truncated: bool
+    bytes_read: int
+    offset: int
+    next_offset: int | None
+    start_line: int | None
+    end_line: int | None
+    total_lines: int | None
+    next_start_line: int | None
+
+
+def _to_file_content(window: _Window, path: str, byte_limit: int) -> FileContent:
+    """Promote an internal window into the public :class:`FileContent`."""
+    return FileContent(
+        content=window.text,
+        path=path,
+        truncated=window.truncated,
+        max_bytes=byte_limit,
+        bytes_read=window.bytes_read,
+        offset=window.offset,
+        next_offset=window.next_offset,
+        start_line=window.start_line,
+        end_line=window.end_line,
+        total_lines=window.total_lines,
+        next_start_line=window.next_start_line,
+    )
+
+
+def _newline_is_single_byte(encoding: str) -> bool:
+    """True when a newline encodes to a single ``0x0A`` byte."""
+    try:
+        return "\n".encode(encoding) == b"\n"
+    except (LookupError, UnicodeError):
+        return False
+
+
+def _trim_partial_char(data: bytes, encoding: str, errors: str) -> bytes:
+    """Drop a trailing partial multi-byte sequence so *data* decodes cleanly."""
+    try:
+        decoder = codecs.getincrementaldecoder(encoding)(errors)
+        decoder.decode(data, final=False)
+        pending = decoder.getstate()[0]
+    except (UnicodeDecodeError, LookupError, AttributeError):
+        return data
+    if pending:
+        return data[: len(data) - len(pending)]
+    return data

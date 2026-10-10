@@ -32,6 +32,7 @@ from .enable import EnableMode
 from .enhanced_executor import EnhancedCommandExecutor
 from .file_manager import FileManager
 from .logging_manager import get_context_logger, get_logger
+from .models import FileContent
 from .session_diagnostics import ConnectionProfileManager, SessionDiagnosticsProvider
 from .session_registry import SessionRegistry
 from .validation import CommandValidator
@@ -1339,7 +1340,10 @@ class SSHSessionManager:
         sudo_password: str | None = None,
         use_sudo: bool = False,
         timeout: int = 30,
-    ) -> tuple[str, str, int]:
+        *,
+        start_line: int = 1,
+        offset: int = 0,
+    ) -> FileContent:
         """Delegate remote file reads to the FileManager helper."""
         return await self.file_manager.read_file(
             host=host,
@@ -1354,6 +1358,8 @@ class SSHSessionManager:
             sudo_password=sudo_password,
             use_sudo=use_sudo,
             timeout=timeout,
+            start_line=start_line,
+            offset=offset,
         )
 
     async def write_file(

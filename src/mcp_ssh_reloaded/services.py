@@ -158,11 +158,13 @@ class SSHService:
         *,
         encoding: str = "utf-8",
         max_bytes: int | None = None,
+        start_line: int = 1,
+        offset: int = 0,
         use_sudo: bool = False,
         timeout: int | None = None,
     ) -> FileContent:
-        """Read a remote file."""
-        content, stderr, exit_code = await self._engine.read_file(
+        """Read a remote file, optionally a resumable window of it."""
+        fc = await self._engine.read_file(
             host=conn.host,
             remote_path=path,
             username=conn.username,
@@ -172,23 +174,19 @@ class SSHService:
             encoding=encoding,
             errors="replace",
             max_bytes=max_bytes,
+            start_line=start_line,
+            offset=offset,
             sudo_password=conn.sudo_password if use_sudo else None,
             use_sudo=use_sudo,
             timeout=timeout or self.config.default_timeout,
         )
-        if exit_code != 0:
+        if fc.error:
             raise SSHError(
                 category=ErrorCategory.PERMISSION,
                 message=f"Cannot read {path}",
-                detail=stderr,
+                detail=fc.error,
             )
-        truncated = "[CONTENT TRUNCATED" in content
-        return FileContent(
-            content=content,
-            path=path,
-            truncated=truncated,
-            max_bytes=max_bytes or self.config.max_file_bytes,
-        )
+        return fc
 
     async def write_file(
         self,

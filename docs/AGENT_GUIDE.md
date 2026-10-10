@@ -36,7 +36,7 @@ This guide covers the patterns you MUST follow to be a good remote operator.
 
 | Tool         | When to use                                                         |
 | ------------ | ------------------------------------------------------------------- |
-| `read_file`  | Read a remote file (SFTP, falls back to `sudo cat`).                |
+| `read_file`  | Read a remote file (SFTP, falls back to `sudo cat`). Long files return a UTF-8-safe line window; resume with `start_line` or `offset`. |
 | `write_file` | Write/create/append a remote file (SFTP, falls back to `sudo tee`). |
 
 ### Interactive / PTY

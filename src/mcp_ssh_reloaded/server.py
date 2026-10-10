@@ -164,8 +164,15 @@ async def read_file(
     max_bytes: int | None = None,
     sudo_password: str | None = None,
     use_sudo: bool = False,
+    start_line: int = 1,
+    offset: int = 0,
 ) -> str:
-    """Read a remote file over SSH. Falls back to sudo cat if permission denied."""
+    """Read a remote file over SSH. Falls back to sudo cat if permission denied.
+
+    Returns at most ``max_bytes`` bytes, cut on a character (and line) boundary.
+    A truncated result reports the line range and how to resume with
+    ``start_line`` or ``offset``.
+    """
     try:
         fc = await _service().read_file(
             ConnectionParams(
@@ -179,11 +186,22 @@ async def read_file(
             remote_path,
             encoding=encoding,
             max_bytes=max_bytes,
+            start_line=start_line,
+            offset=offset,
             use_sudo=use_sudo,
         )
         result = "Exit Status: 0\n\nCONTENT:\n" + fc.content
         if fc.truncated:
-            result += f"\n\n[CONTENT TRUNCATED after {fc.max_bytes} bytes]"
+            result += f"\n\n[CONTENT TRUNCATED after {fc.bytes_read} bytes"
+            if fc.start_line is not None and fc.end_line is not None:
+                result += f"; showing lines {fc.start_line}-{fc.end_line}"
+            if fc.total_lines is not None:
+                result += f" of {fc.total_lines}"
+            if fc.next_start_line is not None:
+                result += f"; continue with start_line={fc.next_start_line}"
+            if fc.next_offset is not None:
+                result += f"; or offset={fc.next_offset}"
+            result += "]"
         return result
     except Exception as e:
         return _fmt_error(e)
@@ -462,7 +480,8 @@ async def get_session_diagnostics(
         if diag.last_activity:
             lines.append(f"⏰ Last Activity: {diag.last_activity}")
         if diag.command_history:
-            lines.append("📚 Recent: " + ", ".join(diag.command_history[-5:]))
+            recent = " | ".join(diag.command_history[-5:])
+            lines.append(f"📚 Recent ({len(diag.command_history)}): {recent}")
         return "\n".join(lines)
     except Exception as e:
         return _fmt_error(e)

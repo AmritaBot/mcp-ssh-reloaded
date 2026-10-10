@@ -13,6 +13,14 @@ if TYPE_CHECKING:
     from mcp_ssh_reloaded.session_manager import SSHSessionManager
 
 
+def _summarize_command(command: str, limit: int = 80) -> str:
+    """Collapse a command to one short line so a heredoc cannot flood output."""
+    collapsed = " ".join(command.split())
+    if len(collapsed) > limit:
+        collapsed = collapsed[: limit - 1] + "\u2026"
+    return collapsed
+
+
 class SessionDiagnosticsProvider:
     """Provides diagnostic information about SSH sessions."""
 
@@ -146,7 +154,7 @@ class SessionDiagnosticsProvider:
 
             # Filter commands for this session
             session_commands = [
-                cmd["command"]
+                _summarize_command(cmd["command"])
                 for cmd in history
                 if cmd.get("session_key") == session_key and cmd.get("command")
             ]
