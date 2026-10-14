@@ -1,4 +1,4 @@
-"""命令回显剥离的回归测试（F4）。"""
+"""Regression tests for command-echo stripping."""
 
 from mcp_ssh_reloaded.session_manager import SSHSessionManager
 

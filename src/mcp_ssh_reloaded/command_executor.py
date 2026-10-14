@@ -1722,7 +1722,7 @@ class CommandExecutor:
             # Use sentinel only for Unix-like shells and non-interactive commands
             sentinel = None
             command_to_send = command
-            # 多行脚本先经 SFTP 落盘再 source，绝不走 PTY 行编辑器
+            # Stage multi-line scripts over SFTP, never through the PTY.
             if is_unix and "\n" in command:
                 script_path = self._sm._upload_script_via_sftp(
                     session_key, client, command
@@ -1744,7 +1744,7 @@ class CommandExecutor:
                 logger.debug(f"Using sentinel marker: {sentinel}")
 
             def _finalize_stdout(text: str) -> str:
-                """剥掉 PTY 回显与尾部哨兵，只留命令真实输出。"""
+                """Strip the PTY echo and trailing sentinel."""
                 return self._sm._strip_command_echo(
                     self._sm._strip_sentinel(text, sentinel), command_to_send
                 ).strip()

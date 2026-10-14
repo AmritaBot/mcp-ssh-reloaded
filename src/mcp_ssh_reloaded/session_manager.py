@@ -428,7 +428,6 @@ class SSHSessionManager:
                 logger.info(f"Recapturing prompt for bash shell on {session_key}")
                 self._capture_prompt(session_key, shell)
 
-        # 关掉 pager / git quotepath / 流控，否则 less 会把整个会话卡住
         if self.registry.shell_types.get(session_key, "unknown") == "unix_shell":
             self._configure_shell_environment(session_key, shell)
 
@@ -500,9 +499,6 @@ class SSHSessionManager:
         # Set up prompt pattern based on device type and actual output
         self._ensure_prompt_pattern(session_key, None, initial_output)  # pyright: ignore[reportArgumentType]
 
-    #: 一次性写入 shell 的环境设置。
-    #: PAGER/GIT_PAGER/LESS 关掉分页器，GIT_CONFIG_* 关掉 git 的八进制路径转义，
-    #: stty -ixon 关掉 Ctrl-S 流控（另一个能把会话冻住的老坑）。
     _SHELL_ENV_INIT = (
         "export PAGER=cat GIT_PAGER=cat SYSTEMD_PAGER=cat MANPAGER=cat LESS=FRX; "
         "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.quotepath "
@@ -515,7 +511,7 @@ class SSHSessionManager:
     def _configure_shell_environment(
         self, session_key: str, shell: paramiko.Channel
     ) -> None:
-        """把 shell 调成非交互友好模式，并丢弃回显，避免污染下一条命令的输出。"""
+        """Disable pagers and drain the echo."""
         logger = self.logger.getChild("shell_env")
         try:
             shell.send((self._SHELL_ENV_INIT + "\n").encode("utf-8"))
@@ -534,12 +530,7 @@ class SSHSessionManager:
     def _upload_script_via_sftp(
         self, session_key: str, client: paramiko.SSHClient, script: str
     ) -> str | None:
-        """把多行脚本经 SFTP 落到远端临时文件，回读校验后返回路径。
-
-        多行内容绝不能走 PTY：远端 readline 会把脚本里的控制字节当成编辑命令，
-        回灌历史或补全内容，静默改坏脚本（实测提交信息里被插进过别的会话的命令）。
-        校验失败或 SFTP 不可用时返回 None，调用方回退到内联发送。
-        """
+        """Stage a multi-line script over SFTP so it never reaches the PTY."""
         logger = self.logger.getChild("script_upload")
         payload = script.encode("utf-8")
         path = f"/tmp/.mcp_ssh_cmd_{uuid.uuid4().hex[:12]}.sh"
@@ -568,7 +559,7 @@ class SSHSessionManager:
 
     @staticmethod
     def _condense_for_echo_compare(text: str) -> str:
-        """压掉空白与 readline 重绘造成的连续重复字符，便于和回显比对。"""
+        """Collapse whitespace and readline redraw duplication."""
         out: list[str] = []
         prev = ""
         for ch in text:
@@ -579,13 +570,7 @@ class SSHSessionManager:
         return "".join(out)
 
     def _strip_command_echo(self, output: str, command: str) -> str:
-        """剥掉输出开头那段命令回显。
-
-        交互式 shell 会把发过去的命令原样打回来，还常被 readline 重绘成
-        `commmitmsg2` / `showw-current` 这种重复字符。调用方只想要命令的真实
-        输出，所以按行比对命令文本，把重合的开头整段丢掉；比对不上就原样返回，
-        宁可留噪声也不误删真实输出。
-        """
+        """Drop the leading echo of the command, keeping the real output."""
         if not output or not command:
             return output
         cleaned = self._strip_ansi(output)
@@ -1318,7 +1303,7 @@ class SSHSessionManager:
             # Common pager prompt when less/most waits for input
             logger.debug("Detected pager ':' prompt")
             return "pager"
-        # less 的帮助页、more 的 --More--、less 状态行同样会让会话等输入
+        # Secondary pager screens.
         if re.search(r"HELP -- Press RETURN for more", clean_output):
             logger.debug("Detected less help screen")
             return "pager"
