@@ -12,16 +12,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import paramiko
+from paramiko.ssh_exception import NoValidConnectionsError
 
 if TYPE_CHECKING:
     from .session_manager import SSHSessionManager
-
-try:
-    NoValidConnectionsError = paramiko.NoValidConnectionsError  # pyright: ignore[reportAttributeAccessIssue]
-except AttributeError:
-    from paramiko.ssh_exception import (
-        NoValidConnectionsError,
-    )
 
 
 class ConnectionManager:

@@ -361,8 +361,7 @@ class FileManager:
                     logger.error(f"Failed to create directories with sudo: {stderr}")
                     return "", f"Failed to create directories: {stderr}", exit_code
 
-        # Write content using tee (supports both write and append)
-        # Use base64 encoding to avoid shell escaping issues with special characters
+        # base64 keeps special characters intact; tee covers write and append.
         try:
             encoded_content = base64.b64encode(
                 content.encode(used_encoding, used_errors)

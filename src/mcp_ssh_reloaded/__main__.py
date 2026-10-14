@@ -12,11 +12,10 @@ Supports multiple modes:
 import argparse
 import asyncio
 import sys
+from typing import Any, Literal, cast
 
 from .api_types import ConnectionParams, ServerConfig
 from .services import SSHService
-
-#  helpers
 
 
 def _add_config_args(parser: argparse.ArgumentParser, prefix: str = "") -> None:
@@ -125,15 +124,12 @@ def _add_config_args(parser: argparse.ArgumentParser, prefix: str = "") -> None:
 
 def _build_config_from_args(args: argparse.Namespace) -> ServerConfig:
     """Build ServerConfig: Pydantic reads env vars, CLI overrides take precedence."""
-    overrides: dict[str, object] = {}
+    overrides: dict[str, Any] = {}
     for field_name in ServerConfig.model_fields:
         val = getattr(args, field_name, None)
         if val is not None:
             overrides[field_name] = val
-    return ServerConfig(**overrides)  # type: ignore[arg-type]  # values from argparse, coerced by arg types
-
-
-#  main
+    return ServerConfig(**overrides)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -229,13 +225,16 @@ def main(argv: list[str] | None = None) -> None:
         _run_mcp()
 
 
+Transport = Literal["stdio", "sse", "streamable-http"]
+
+
 def _run_mcp(
-    transport: str = "stdio", config: ServerConfig | None = None, **kwargs: object
+    transport: str = "stdio", config: ServerConfig | None = None, **kwargs: Any
 ) -> None:
     from .server import configure_server, mcp
 
     configure_server(config)
-    mcp.run(transport=transport, **kwargs)  # type: ignore[arg-type]
+    mcp.run(transport=cast(Transport, transport), **kwargs)
 
 
 def _run_exec(args) -> None:

@@ -47,7 +47,6 @@ class SSHService:
         self.logger: logging.Logger = logger or logging.getLogger("ssh_service")
         self._engine = SSHSessionManager(config=self.config)
 
-    #  execute
 
     async def execute(
         self,
@@ -106,7 +105,6 @@ class SSHService:
         except Exception as e:
             raise _to_ssh_error(e)
 
-    #  execute async
 
     async def execute_async(
         self,
@@ -149,7 +147,6 @@ class SSHService:
         """List completed/failed/interrupted commands."""
         return self._engine.list_command_history(limit)
 
-    #  file ops
 
     async def read_file(
         self,
@@ -229,7 +226,6 @@ class SSHService:
             )
         return msg
 
-    #  session lifecycle
 
     async def list_sessions(self) -> list[SessionInfo]:
         """List active SSH sessions."""
@@ -266,7 +262,6 @@ class SSHService:
         """Close all sessions."""
         await self._engine.close_all_sessions()
 
-    #  diagnostics
 
     async def get_diagnostics(self, conn: ConnectionParams) -> SessionDiagnostics:
         """Get session diagnostic info."""
@@ -284,15 +279,11 @@ class SSHService:
         """Get performance metrics."""
         return self._engine.get_performance_metrics()
 
-    #  raw access (for legacy code)
 
     @property
     def engine(self) -> SSHSessionManager:
         """Access the underlying engine for legacy code paths."""
         return self._engine
-
-
-#  helpers
 
 
 def _now_ms() -> float:

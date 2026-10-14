@@ -357,9 +357,7 @@ class CommandExecutor:
             host, username, port
         )
 
-        # Prepare session and shell first (outside lock to avoid blocking)
-        # Note: This avoids race conditions where two threads check for running commands
-        # simultaneously before either registers one.
+        # Register outside the lock so two threads cannot both see it as free.
         client = await self._session_manager.get_or_create_session(
             host, username, password, key_filename, port
         )
@@ -766,8 +764,7 @@ class CommandExecutor:
                         f"Command {command_id} transitioned from AWAITING_INPUT to RUNNING after input sent"
                     )
 
-                    # Submit a background task to continue monitoring for command completion
-                    # We don't wait for it - that would block the MCP server
+                    # Monitor in the background; waiting here would block the server.
                     logger.debug(
                         f"Submitting background monitoring task for {command_id}"
                     )
@@ -822,22 +819,14 @@ class CommandExecutor:
                         break
                 time.sleep(0.1)
 
-            # Parse output
-            # Output will contain the command echo (maybe) and the result number
             clean_output = self._session_manager._strip_ansi(output)
 
             # Look for the last number in the output
             matches = re.findall(r"\b(\d+)\b", clean_output)
             if matches:
-                # The last number is likely the exit code
-                # But we need to be careful about the command echo "echo 0"
-                # If we send "echo $?", we might get:
-                # echo $?
-                # 0
-                # prompt
+                # Take the last number before the prompt; the echo prints digits too.
 
-                # If we have multiple numbers, the last one before the prompt (if any) or just the last line number
-                # A safer bet is searching for a line that is just digits
+                # Prefer a line that is only digits.
                 lines = [
                     line.strip() for line in clean_output.splitlines() if line.strip()
                 ]
@@ -960,10 +949,7 @@ class CommandExecutor:
                                 )
                                 last_log_time = time.time()
 
-                            # Optimization: During active output, we primarily want to update stdout
-                            # so get_command_status shows progress. We only check for prompts/input
-                            # if the chunk looks like it might contain one (e.g. ends with prompt-like char)
-                            # or if we have a lot of new data.
+                            # Probe for prompts only on prompt-like chunks or after lots of new data.
                             should_check = False
                             if len(chunk) < 100:  # Small chunks often contain prompts
                                 stripped_chunk = self._session_manager._strip_ansi(
@@ -977,8 +963,7 @@ class CommandExecutor:
                                 ):
                                     should_check = True
 
-                            # Also check if we have accumulated a lot of data since last check
-                            # and periodically update stdout so users see progress
+                            # Flush stdout periodically so get_command_status shows progress.
                             if not should_check and (
                                 len(chunk) > 16384 or poll_count % 50 == 0
                             ):
@@ -1224,10 +1209,7 @@ class CommandExecutor:
                                 )
                                 last_log_time = time.time()
 
-                            # Optimization: During active output, we primarily want to update stdout
-                            # so get_command_status shows progress. We only check for prompts/input
-                            # if the chunk looks like it might contain one (e.g. ends with prompt-like char)
-                            # or if we have a lot of new data.
+                            # Probe for prompts only on prompt-like chunks or after lots of new data.
                             should_check = False
                             if len(chunk) < 100:  # Small chunks often contain prompts
                                 stripped_chunk = self._session_manager._strip_ansi(
@@ -1241,8 +1223,7 @@ class CommandExecutor:
                                 ):
                                     should_check = True
 
-                            # Also check if we have accumulated a lot of data since last check
-                            # and periodically update stdout so users see progress
+                            # Flush stdout periodically so get_command_status shows progress.
                             if not should_check and (
                                 len(chunk) > 16384 or poll_count % 50 == 0
                             ):
@@ -1545,9 +1526,6 @@ class CommandExecutor:
         """
         logger = self._sm.logger.getChild("sudo_command")
 
-        # Get session key for this client
-        # We need to derive the session key from the client
-        # Find the session key that matches this client
         session_key = None
         with self._sm.registry.lock:
             for key, sess_client in self._sm.registry.sessions.items():
@@ -1825,8 +1803,7 @@ class CommandExecutor:
                     limited_chunk, should_continue = output_buffer.add_chunk(chunk)
                     raw_output_chunks.append(limited_chunk)
 
-                    # Optimization: We primarily check for prompts/input on small chunks
-                    # or after data accumulation.
+                    # Probe for prompts on small chunks or after accumulation.
                     should_check = False
                     if len(chunk) < 100:  # Small chunks often contain prompts
                         stripped_chunk = self._sm._strip_ansi(chunk)
@@ -1841,8 +1818,7 @@ class CommandExecutor:
                     if not should_check and (len(raw_output_chunks) % 20 == 0):
                         should_check = True
 
-                    # ALWAYS update raw_output if we need to check echo, limit, or sentinel
-                    # to ensure we don't use stale data.
+                    # Keep raw_output fresh when echo, limit or sentinel checks are due.
                     if should_check or not seen_command_echo or sentinel:
                         raw_output = "".join(raw_output_chunks)
 
@@ -1868,8 +1844,7 @@ class CommandExecutor:
                         # Check for interactive prompts BEFORE checking for completion
                         awaiting = self._sm._detect_awaiting_input(raw_output, session_key)
                         if awaiting:
-                            # Only treat as awaiting input after a brief idle and if prompt isn't present
-                            # Exception: Pagers should be handled immediately to keep stream flowing
+                            # Awaiting input needs a brief idle, except for pagers.
                             if (
                                 awaiting == "pager"
                                 or (time.time() - last_recv_time) > 0.2
@@ -1890,8 +1865,7 @@ class CommandExecutor:
                                             "Automatically handling pager - sending 'q' to quit"
                                         )
 
-                                        # Strip MikroTik pager prompt from output to avoid agent confusion
-                                        # Match raw output as detection does
+                                        # Strip the MikroTik pager prompt, matching raw output as detection does.
                                         raw_output = re.sub(
                                             r"--\s*\[Q quit\|D dump\|.*?\]\s*$",
                                             "",
@@ -1901,8 +1875,7 @@ class CommandExecutor:
                                         raw_output_chunks = [raw_output]
 
                                         shell.send(b"q")
-                                        # Wait for pager to exit and shell prompt to appear
-                                        # Don't just continue - actively wait for the prompt
+                                        # Wait for the prompt to come back after quitting the pager.
                                         pager_exit_start = time.time()
                                         pager_exit_timeout = 3.0
                                         while (
@@ -1971,26 +1944,21 @@ class CommandExecutor:
                         # Extract exit code and clean output
                         clean_output = self._sm._strip_ansi(raw_output)
 
-                        # Find sentinel and exit code
-                        # Pattern: marker + digits
+                        # Sentinel is marker + digits.
                         sentinel_pattern = re.compile(re.escape(sentinel) + r"(\d+)")
                         match = sentinel_pattern.search(clean_output)
                         if match:
                             exit_code = int(match.group(1))
 
-                            # Clean up output: remove everything from sentinel onwards using the match position
-                            # This avoids truncating at the command echo which also contains the sentinel string
+                            # Cut at the match, not at the echoed sentinel string.
 
-                            # We use clean_output for truncation to ensure accurate regex index matching
-                            # match.start() is the index of the sentinel in clean_output
+                            # Indices come from clean_output, so truncate that one.
                             final_output = clean_output[: match.start()]
 
                             # We should return the clean output directly
                             return final_output.strip(), "", exit_code, None, sentinel
 
-                    # Check for command completion using captured prompt or pattern
-                    # Only check after brief idle to avoid false positives from command echo
-                    # AND make sure we've seen the command echo (newline)
+                    # Prompt matching only after a brief idle and once the echo has ended.
                     if seen_command_echo and (time.time() - last_recv_time) > 0.2:
                         clean_output = self._sm._strip_ansi(raw_output)
                         tail_start = echo_end_pos or 0
@@ -2000,14 +1968,9 @@ class CommandExecutor:
                             session_key, raw_output, tail_clean
                         )
 
-                        # If sentinel mode is on, we ignore simple prompt matching unless
-                        # we are really sure or it's been a long time?
-                        # Actually, the bug is "Cost is 10$" triggers prompt match.
-                        # If we have a sentinel, "Cost is 10$" will appear, but sentinel won't.
-                        # So we should IGNORE is_complete if sentinel is active and sentinel not found.
+                        # With a sentinel active, ignore prompt matches: "Cost is 10$" fakes one.
                         if sentinel and is_complete:
-                            # Logic: If sentinel is used, we trust sentinel.
-                            # We DO NOT return on prompt detection alone to fix the bug.
+                            # Trust the sentinel; never return on prompt detection alone.
                             is_complete = False
                     else:
                         is_complete = False
@@ -2072,8 +2035,7 @@ class CommandExecutor:
                                     f"Prompt detection failed {miss_count} times for {session_key}. "
                                     f"Shell state may be corrupted. Consider closing and recreating the session."
                                 )
-                                # Mark the shell as needing reset by closing it
-                                # The next command will create a new shell
+                                # Close the shell; the next command recreates it.
                                 try:
                                     shell.close()
                                 except Exception:
@@ -2159,8 +2121,7 @@ class CommandExecutor:
                                     "Pager quit during idle, continuing to wait for shell prompt"
                                 )
                                 continue
-                            # For other types of input (password, etc.), return and let agent handle
-                            # Only return awaiting input if prompt isn't already visible
+                            # Return password-style prompts unless the prompt is already visible.
                             tail_start = echo_end_pos or 0
                             tail_clean = clean_output[tail_start:]
                             is_complete, _ = self._sm._check_prompt_completion(
@@ -2189,17 +2150,10 @@ class CommandExecutor:
                             # If sentinel is active, verify sentinel presence even on idle timeout
                             if sentinel:
                                 if sentinel in raw_output:
-                                    # Sentinel found, we can proceed
-                                    # Logic handled in main loop, but here we are in idle block
-                                    # Let main loop handle it in next iteration (idle doesn't break loop unless we return)
+                                    # Sentinel found: let the main loop finish it next iteration.
                                     pass
                                 else:
-                                    # Sentinel NOT found, but prompt found.
-                                    # This is the ambiguous case.
-                                    # If we return here, we risk the bug.
-                                    # If we don't, we risk hanging if sentinel is lost.
-                                    # Given the bug report, we MUST prioritize avoiding false positives.
-                                    # So we ignore the prompt if sentinel is missing.
+                                    # Prompt but no sentinel: favour a false negative over a false positive.
                                     logger.debug(
                                         "Sentinel active but not found - ignoring prompt detection on idle"
                                     )
@@ -2276,8 +2230,7 @@ class CommandExecutor:
                 if shell.recv_ready():
                     output = shell.recv(4096).decode("utf-8", errors="ignore")
                     clean = self._sm._strip_ansi(output).strip()
-                    # Check if prompt ends with # (standard enable mode indicator)
-                    # We also check if it contains '>' which usually indicates user mode
+                    # '#' marks enable mode, '>' marks user mode.
                     if (
                         clean
                         and not clean.endswith("#")
