@@ -17,7 +17,6 @@ from datetime import datetime
 from typing import Any
 
 import paramiko
-
 import pyte
 
 from .command_executor import CommandExecutor
@@ -142,8 +141,7 @@ class SSHSessionManager:
 
     def __del__(self):
         if not all(
-            hasattr(self, attr)
-            for attr in ("logger", "connection", "command_executor")
+            hasattr(self, attr) for attr in ("logger", "connection", "command_executor")
         ):
             return  # __init__ never completed (e.g. failed during tests)
         self.logger.info("SSHSessionManager destroyed, ensuring cleanup.")
