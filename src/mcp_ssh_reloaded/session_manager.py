@@ -75,7 +75,6 @@ class SSHSessionManager:
         self.context_logger = get_context_logger("ssh_session")
         self.logger.info("SSHSessionManager initialized with enhanced logging")
 
-        #  Extracted sub-modules
         self.connection = ConnectionManager(self)
         self.enable_mode = EnableMode(self)
 
@@ -99,7 +98,6 @@ class SSHSessionManager:
         self.command_executor = CommandExecutor(self, config=self.config)
         self.file_manager = FileManager(self)
 
-    #  Read-only views (collaborators used to reach into privates)
 
     @property
     def command_validator(self):
@@ -116,7 +114,6 @@ class SSHSessionManager:
         """Whether validation is relaxed for PTY inspection commands."""
         return self._pty_aware_validation
 
-    #  Delegates to ConnectionManager
 
     def _load_ssh_config(self):
         return ConnectionManager.load_ssh_config()
@@ -161,7 +158,6 @@ class SSHSessionManager:
     async def list_sessions(self) -> list[str]:
         return await self.connection.list_sessions()
 
-    #  Delegates to EnableMode
 
     async def _enter_enable_mode(
         self,
@@ -179,7 +175,6 @@ class SSHSessionManager:
             timeout or self.ENABLE_MODE_TIMEOUT,
         )
 
-    #  Shell / PTY / prompt / exec internals
 
     def _feed_emulator(self, session_key: str, data: str) -> None:
         """Feed data to terminal emulator if interactive mode is enabled."""
@@ -222,8 +217,7 @@ class SSHSessionManager:
             last_line = lines[-1] if lines else ""
             screen_text = "\n".join(lines)
 
-            # Check for editor (vim, nano)
-            # Vim: status line with -- INSERT --, -- VISUAL --, or many ~ lines at the start of lines
+            # Editor detection: -- INSERT --, -- VISUAL -- or leading ~ lines.
             if any(
                 marker in screen_text
                 for marker in ["-- INSERT --", "-- VISUAL --", "-- REPLACE --"]
@@ -303,7 +297,6 @@ class SSHSessionManager:
             "height": screen.lines,
         }
 
-    #  Shell / PTY / prompt / exec internals
 
     def _get_or_create_shell(
         self, session_key: str, client: paramiko.SSHClient
@@ -372,8 +365,7 @@ class SSHSessionManager:
         # Capture the actual prompt for this session
         self._capture_prompt(session_key, shell)
 
-        # For non-POSIX Unix shells, start bash to avoid compatibility issues
-        # We do this AFTER capturing the initial prompt to ensure the shell is responsive
+        # Start bash for non-POSIX shells, after the initial prompt is captured.
         device_type = self.registry.shell_types.get(session_key, "unknown")
         if device_type == "unix_shell":
             # Detect non-POSIX shells (fish, nushell, elvish, etc.)
@@ -385,8 +377,7 @@ class SSHSessionManager:
             # If not detected from banner, specifically probe for fish shell
             if not is_non_posix:
                 logger.debug(f"Probing for fish shell on {session_key}")
-                # Use a probe that works in both bash and fish but produces different output
-                # In fish, $FISH_VERSION is set. In bash, it's usually not.
+                # $FISH_VERSION distinguishes fish from bash.
                 shell.send(b'echo "FISH_CHECK:$FISH_VERSION"\n')
 
                 probe_output = ""
@@ -402,9 +393,7 @@ class SSHSessionManager:
 
                 logger.debug(f"Probe output: {probe_output!r}")
 
-                # Look for version number pattern after FISH_CHECK:
-                # Fish: FISH_CHECK:3.6.1
-                # Bash: FISH_CHECK:
+                # Fish prints FISH_CHECK:3.6.1, bash prints FISH_CHECK:
                 if re.search(r"FISH_CHECK:\d+\.", probe_output):
                     logger.info(
                         f"Detected fish shell via probe, starting bash for {session_key}"
@@ -634,8 +623,7 @@ class SSHSessionManager:
                     output = shell.recv(4096).decode("utf-8", errors="ignore")
                     logger.debug(f"Capture prompt received: {output!r}")
             else:
-                # Unix/Linux shells: try echo with marker
-                # Use leading space to avoid history pollution
+                # Leading space keeps the marker command out of shell history.
                 marker = f"__MCP_PROMPT_MARKER_{uuid.uuid4().hex[:8]}__"
                 shell.send(f' echo "{marker}"\n'.encode())
                 time.sleep(0.5)
@@ -783,8 +771,7 @@ class SSHSessionManager:
                     return parts[0] + " *]" + prompt_char
                 return bracket_content + "]" + prompt_char
 
-        # Pattern 3: user@host:/path$ or user@host:~$ or user@host:~/path$
-        # Generalize: user@host:*$ or user@host:*#
+        # Generalise user@host:/path$ to user@host:*$.
         if ":" in prompt and "@" in prompt:
             # Replace path after : with *
             parts = prompt.rsplit(":", 1)
@@ -804,8 +791,7 @@ class SSHSessionManager:
                         generalized = parts[0] + ":*" + prompt_char
                         return generalized
 
-        # Pattern 4: user@host directory$ or user@host directory#
-        # Generalize: user@host *$ or user@host *#
+        # Generalise user@host directory$ to user@host *$.
         if "@" in prompt and " " in prompt:
             match = re.search(r"(@[^\s]+\s+)(.+)([>#\$%]\s*)$", prompt)
             if match:
@@ -979,8 +965,7 @@ class SSHSessionManager:
         pattern_str = pattern_str.replace("\\w", "[^\\]\\s]*")  # full working dir
         pattern_str = pattern_str.replace("\\$", "[$#]")  # $ or #
 
-        # Now escape special regex chars, but preserve our bracket patterns
-        # First mark our patterns to protect them
+        # Escape regex chars, but keep our own bracket patterns.
         pattern_str = pattern_str.replace("[^@\\s]+", "___USERNAME___")
         pattern_str = pattern_str.replace("[^\\s\\]]+", "___HOSTNAME___")
         pattern_str = pattern_str.replace("[^\\]\\s]*", "___DIRNAME___")
@@ -1058,12 +1043,8 @@ class SSHSessionManager:
         if not sentinel or sentinel not in output:
             return output
 
-        # Strip the entire sentinel command block if it's visible
-        # It typically looks like: __mcp_status=$?; printf '\nMARKER%d\n' ...
-        # Or it might be partially visible.
 
-        # First, try to find the start of the sentinel command
-        # We look for the assignment to __mcp_status which is the start of our sentinel block
+        # The sentinel block starts at the __mcp_status assignment.
         sentinel_start = output.find("__mcp_status=$?")
         if sentinel_start != -1:
             return output[:sentinel_start].rstrip()
@@ -1153,9 +1134,7 @@ class SSHSessionManager:
         if session_key in self.registry.prompts:
             literal_prompt = self.registry.prompts[session_key]
 
-            # Optimization: Only check the end of the output for prompt match
-            # Most prompts are on the last line or within a few hundred chars.
-            # 4096 is more than enough context even for complex multi-line prompts.
+            # Only the tail can hold a prompt; 4096 chars is plenty.
             if len(clean_output) > 4096:
                 check_buffer = clean_output[-4096:].rstrip()
                 buffer_offset = len(clean_output) - 4096
@@ -1165,11 +1144,9 @@ class SSHSessionManager:
 
             # Check if prompt contains wildcards or character classes (generalized)
             if "*" in literal_prompt or "[" in literal_prompt:
-                # Convert to pattern for wildcard matching
-                # Escape special regex chars except * and []
+                # Escape regex chars except * and [].
                 pattern_str = re.escape(literal_prompt).replace(r"\*", ".*?")
-                # Un-escape specific character classes we use (like [>#] from enable mode)
-                # Do NOT unescape all brackets as that breaks literal brackets in prompts
+                # Restore the classes we inject, e.g. [>#] for enable mode.
                 pattern_str = pattern_str.replace(r"\[>#\]", "[>#]").replace(
                     r"\[\$#\]", "[$#]"
                 )
@@ -1188,8 +1165,6 @@ class SSHSessionManager:
 
                 match = pattern.search(check_buffer)
                 if match:
-                    # Remove the matched prompt from output
-                    # We need to use the full clean_output for the final result
                     final_match_pos = buffer_offset + match.start()
                     output = clean_output[:final_match_pos].rstrip()
                     logger.debug(
@@ -1244,8 +1219,7 @@ class SSHSessionManager:
         if self._interactive_mode and session_key in self.registry.modes:
             mode = self.registry.modes.get(session_key, "unknown")
 
-            # If in editor mode, don't flag as awaiting input
-            # Editors handle their own input and shouldn't be interrupted
+            # Editors handle their own input; never interrupt them.
             if mode == "editor":
                 self._log_debug_rate_limited(
                     logger,
@@ -1254,12 +1228,9 @@ class SSHSessionManager:
                 )
                 return None
 
-            # For pager mode, allow pager detection to proceed
-            # For shell/password_prompt/unknown, use normal detection
+            # Pagers keep their own path; everything else uses normal detection.
 
-        # Only process the last 4096 characters of output to avoid O(N^2) performance issues
-        # with very large output buffers (like long-running command output).
-        # Most prompts and input requests appear at the very end of the output.
+        # Only scan the tail: prompts sit at the end and full scans are O(N^2).
         if len(output) > 4096:
             output_to_check = output[-4096:]
         else:
@@ -1278,10 +1249,7 @@ class SSHSessionManager:
         lines = [line for line in clean_output.splitlines() if line.strip()]
         last_line = lines[-1].strip() if lines else ""
 
-        # Common password prompts - match various formats like "password:", "password for user:", etc.
-        # Note: We do NOT use re.MULTILINE so $ matches only the end of the string
-        # We also exclude newlines, =, ", and ' from the wildcard to prevent matching
-        # across lines, URL parameters, or JSON keys
+        # No re.MULTILINE, so $ is end-of-string; exclude newlines, = and quotes.
         if re.search(r'password[^:=\n"\']*:?\s*$', last_line, re.IGNORECASE):
             logger.debug("Detected password prompt")
             return "password"
@@ -1289,9 +1257,7 @@ class SSHSessionManager:
             logger.debug("Detected passphrase prompt")
             return "passphrase"
 
-        # Pager prompts (less, more, MikroTik)
-        # Match (END) with optional line numbers before it, or : on the last line
-        # Strip ANSI codes from the end to properly detect pager prompts
+        # Pager prompts: (END), a trailing ':', less status lines, --More--.
         if re.search(r"(?:^|[\r\n]).*?\(END\)\s*$", clean_output):
             logger.debug("Detected pager (END) prompt")
             return "pager"

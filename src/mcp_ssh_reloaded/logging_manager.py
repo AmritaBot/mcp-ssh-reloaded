@@ -190,7 +190,7 @@ class RateLimitedLogger:
         """Get a child logger."""
         return RateLimitedLogger(f"{self.name}.{suffix}")
 
-    def get_stats(self) -> dict[str, Any]:  # pyright: ignore[reportUnknownParameterType]
+    def get_stats(self) -> dict[str, Any]:
         """Get logging statistics."""
         with self._lock:
             return {

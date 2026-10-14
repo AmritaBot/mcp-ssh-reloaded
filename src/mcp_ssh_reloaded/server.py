@@ -14,7 +14,6 @@ from .api_types import ConnectionParams, ServerConfig
 from .error_handler import ErrorHandler
 from .services import SSHService
 
-#  MCP server instance
 mcp = FastMCP("ssh-session")
 
 # Lazy init so tests that import server.py don't trigger engine construction.
@@ -61,9 +60,6 @@ def _conn(
         enable_command=enable_command,
         sudo_password=sudo_password,
     )
-
-
-#  Core tools
 
 
 @mcp.tool()
@@ -250,9 +246,6 @@ async def write_file(
         return _fmt_error(e)
 
 
-#  Async / interactive tools
-
-
 @mcp.tool()
 async def execute_command_async(
     host: str,
@@ -347,8 +340,7 @@ async def send_input(command_id: str, input_text: str) -> str:
     return result
 
 
-#  Session-level input / screen tools
-# (These rely on engine internals - kept for backward compat)
+# Session-level input/screen tools, kept for backward compatibility.
 
 
 @mcp.tool()
@@ -416,9 +408,6 @@ def send_keys(
         return f"Successfully sent keys to {host}"
     except Exception as e:
         return f"Error: {e}"
-
-
-#  Enhanced / diagnostics tools
 
 
 @mcp.tool()
@@ -544,9 +533,6 @@ async def get_performance_metrics() -> str:
     for op, data in m.items():
         lines.append(f"  {op}: {data['count']} calls, avg {data['avg_time']:.3f}s")
     return "\n".join(lines)
-
-
-#  helpers
 
 
 def _fmt_error(exc: Exception) -> str:

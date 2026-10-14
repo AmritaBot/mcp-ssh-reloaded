@@ -862,7 +862,7 @@ wheels = [
 
 [[package]]
 name = "mcp-ssh-reloaded"
-version = "0.4.1"
+version = "0.4.2"
 source = { editable = "." }
 dependencies = [
     { name = "aiologic" },

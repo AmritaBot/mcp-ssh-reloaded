@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from concurrent.futures import Future as ConcurrentFuture
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any
@@ -85,7 +85,7 @@ class ConnectionParams:
 
     def with_overrides(self, **kw) -> "ConnectionParams":
         """Return a copy with some fields replaced."""
-        d = {f.name: getattr(self, f.name) for f in self.__dataclass_fields__.values()}  # type: ignore[arg-type]
+        d = {f.name: getattr(self, f.name) for f in fields(self)}
         d.update(kw)
         return ConnectionParams(**d)
 
