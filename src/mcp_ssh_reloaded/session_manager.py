@@ -18,11 +18,6 @@ from typing import Any
 
 import paramiko
 
-try:
-    NoValidConnectionsError = paramiko.NoValidConnectionsError  # pyright: ignore[reportAttributeAccessIssue]
-except AttributeError:
-    pass
-
 import pyte
 
 from .command_executor import CommandExecutor
@@ -146,7 +141,10 @@ class SSHSessionManager:
         await self.connection.close_all_sessions()
 
     def __del__(self):
-        if not hasattr(self, "logger"):
+        if not all(
+            hasattr(self, attr)
+            for attr in ("logger", "connection", "command_executor")
+        ):
             return  # __init__ never completed (e.g. failed during tests)
         self.logger.info("SSHSessionManager destroyed, ensuring cleanup.")
         try:
@@ -154,13 +152,13 @@ class SSHSessionManager:
         except Exception as e:
             self.logger.logger.error(
                 f"Error during __del__ cleanup: {e}", exc_info=True
-            )  # pyright: ignore[reportPossiblyUnboundVariable]
+            )
         try:
             self.command_executor.shutdown()
         except Exception as e:
             self.logger.logger.error(
                 f"Error shutting down executor: {e}", exc_info=True
-            )  # pyright: ignore[reportPossiblyUnboundVariable]
+            )
 
     async def list_sessions(self) -> list[str]:
         return await self.connection.list_sessions()
@@ -497,7 +495,7 @@ class SSHSessionManager:
         self.registry.shell_types[session_key] = device_type
 
         # Set up prompt pattern based on device type and actual output
-        self._ensure_prompt_pattern(session_key, None, initial_output)  # pyright: ignore[reportArgumentType]
+        self._ensure_prompt_pattern(session_key, None, initial_output)
 
     _SHELL_ENV_INIT = (
         "export PAGER=cat GIT_PAGER=cat SYSTEMD_PAGER=cat MANPAGER=cat LESS=FRX; "
@@ -835,7 +833,7 @@ class SSHSessionManager:
     def _ensure_prompt_pattern(
         self,
         session_key: str,
-        client: paramiko.SSHClient,
+        client: paramiko.SSHClient | None,
         initial_output: str | None = None,
         shell: paramiko.Channel | None = None,
     ) -> re.Pattern:
