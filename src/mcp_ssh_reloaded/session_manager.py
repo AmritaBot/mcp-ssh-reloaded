@@ -516,6 +516,7 @@ class SSHSessionManager:
         self, session_key: str, shell: paramiko.Channel
     ) -> None:
         """把 shell 调成非交互友好模式，并丢弃回显，避免污染下一条命令的输出。"""
+        logger = self.logger.getChild("shell_env")
         try:
             shell.send((self._SHELL_ENV_INIT + "\n").encode("utf-8"))
             deadline = time.time() + 3.0
@@ -539,6 +540,7 @@ class SSHSessionManager:
         回灌历史或补全内容，静默改坏脚本（实测提交信息里被插进过别的会话的命令）。
         校验失败或 SFTP 不可用时返回 None，调用方回退到内联发送。
         """
+        logger = self.logger.getChild("script_upload")
         payload = script.encode("utf-8")
         path = f"/tmp/.mcp_ssh_cmd_{uuid.uuid4().hex[:12]}.sh"
         try:
