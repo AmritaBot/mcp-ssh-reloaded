@@ -564,6 +564,46 @@ class SSHSessionManager:
         finally:
             sftp.close()
 
+    @staticmethod
+    def _condense_for_echo_compare(text: str) -> str:
+        """压掉空白与 readline 重绘造成的连续重复字符，便于和回显比对。"""
+        out: list[str] = []
+        prev = ""
+        for ch in text:
+            if ch.isspace() or ch == prev:
+                continue
+            out.append(ch)
+            prev = ch
+        return "".join(out)
+
+    def _strip_command_echo(self, output: str, command: str) -> str:
+        """剥掉输出开头那段命令回显。
+
+        交互式 shell 会把发过去的命令原样打回来，还常被 readline 重绘成
+        `commmitmsg2` / `showw-current` 这种重复字符。调用方只想要命令的真实
+        输出，所以按行比对命令文本，把重合的开头整段丢掉；比对不上就原样返回，
+        宁可留噪声也不误删真实输出。
+        """
+        if not output or not command:
+            return output
+        cleaned = self._strip_ansi(output)
+        target = self._condense_for_echo_compare(command)
+        if not target:
+            return cleaned
+        lines = cleaned.splitlines()
+        consumed = 0
+        acc = ""
+        for line in lines:
+            if acc == target:
+                break
+            acc += self._condense_for_echo_compare(line)
+            consumed += 1
+            if len(acc) > len(target):
+                return cleaned
+        if acc == target:
+            return "\n".join(lines[consumed:])
+        return cleaned
+
     def _capture_prompt(self, session_key: str, shell: paramiko.Channel) -> str | None:
         """Capture the actual prompt string for this session by sending a marker command.
 
