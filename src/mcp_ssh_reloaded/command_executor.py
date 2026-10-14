@@ -1722,11 +1722,24 @@ class CommandExecutor:
             # Use sentinel only for Unix-like shells and non-interactive commands
             sentinel = None
             command_to_send = command
+            # 多行脚本先经 SFTP 落盘再 source，绝不走 PTY 行编辑器
+            if is_unix and "\n" in command:
+                script_path = self._sm._upload_script_via_sftp(
+                    session_key, client, command
+                )
+                if script_path:
+                    command_to_send = (
+                        f". {script_path}; __mcp_rc=$?; rm -f {script_path}; "
+                        "(exit $__mcp_rc)"
+                    )
+                    logger.info(f"Multi-line command staged via SFTP: {script_path}")
             # Skip sentinel if command appears to read from stdin (like 'read' command)
             is_interactive_cmd = re.search(r"\bread\b", command)
             if is_unix and not is_interactive_cmd:
                 marker = f"__MCP_CMD_{uuid.uuid4().hex[:8]}__"
-                command_to_send = self._sm._build_command_with_sentinel(command, marker, "")
+                command_to_send = self._sm._build_command_with_sentinel(
+                    command_to_send, marker, ""
+                )
                 sentinel = marker
                 logger.debug(f"Using sentinel marker: {sentinel}")
 

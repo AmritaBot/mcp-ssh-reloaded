@@ -507,6 +507,8 @@ class SSHSessionManager:
         "export PAGER=cat GIT_PAGER=cat SYSTEMD_PAGER=cat MANPAGER=cat LESS=FRX; "
         "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.quotepath "
         "GIT_CONFIG_VALUE_0=false; "
+        "set +H 2>/dev/null; "
+        "bind 'set enable-bracketed-paste on' 2>/dev/null; "
         "stty -ixon 2>/dev/null; true"
     )
 
@@ -527,6 +529,40 @@ class SSHSessionManager:
             logger.warning(
                 f"Failed to configure shell environment for {session_key}: {exc}"
             )
+
+    def _upload_script_via_sftp(
+        self, session_key: str, client: paramiko.SSHClient, script: str
+    ) -> str | None:
+        """把多行脚本经 SFTP 落到远端临时文件，回读校验后返回路径。
+
+        多行内容绝不能走 PTY：远端 readline 会把脚本里的控制字节当成编辑命令，
+        回灌历史或补全内容，静默改坏脚本（实测提交信息里被插进过别的会话的命令）。
+        校验失败或 SFTP 不可用时返回 None，调用方回退到内联发送。
+        """
+        payload = script.encode("utf-8")
+        path = f"/tmp/.mcp_ssh_cmd_{uuid.uuid4().hex[:12]}.sh"
+        try:
+            sftp = client.open_sftp()
+        except Exception as exc:
+            logger.warning(f"SFTP unavailable for {session_key}: {exc}; sending inline")
+            return None
+        try:
+            with sftp.open(path, "wb") as handle:
+                handle.write(payload)
+            with sftp.open(path, "rb") as handle:
+                echoed = handle.read()
+            if echoed != payload:
+                logger.error(
+                    f"Script verification failed for {session_key} "
+                    f"({len(echoed)}/{len(payload)} bytes); sending inline"
+                )
+                return None
+            return path
+        except Exception as exc:
+            logger.warning(f"Failed to stage script for {session_key}: {exc}")
+            return None
+        finally:
+            sftp.close()
 
     def _capture_prompt(self, session_key: str, shell: paramiko.Channel) -> str | None:
         """Capture the actual prompt string for this session by sending a marker command.
