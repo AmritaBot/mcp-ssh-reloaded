@@ -68,3 +68,34 @@ uv run pytest tests/ \
 **原因**：完成检测在 sentinel 分支按 marker 的位置截断，而 shell 回显里同样包含该 marker，于是回显的前半段被保留了下来。
 
 **状态**：已知问题，属于输出处理（`OutputBuffer`）待重构的范畴，暂未修复。用例断言目前只做包含判断，不受影响。
+
+
+---
+
+## 管道与退出码（F7 / F8）
+
+`execute_command` 返回的是命令在远端 shell 里的完整会话输出。长命令不要接 `| tail`：
+
+- 管道会引入缓冲，命令还没吐字就超时转后台时，前一段输出会整段丢掉；
+- `cmd | tail -30; echo $?` 里的 `$?` 是 `tail` 的退出码，不是 `cmd` 的，会误导成执行成功。
+
+要落盘再读：`cmd | tee /tmp/out.log`，然后用 `read_file` 分段读。
+一定要看真实退出码时用 `set -o pipefail` 或 `${PIPESTATUS[0]}`。
+
+## 卡在 pager / 等待输入时怎么办（F11）
+
+会话被分页器或交互提示拦住时，不要直接重发命令——新命令会被灌进 pager。
+
+- 先 `send_keys(host, "q")` 退出 `less` / `more`；仍在等待输入就再发一次；
+- 还不行用 `send_keys(host, "C-c")` 中断，然后重发；
+- `read_screen(host)` 在 `MCP_SSH_INTERACTIVE_MODE=1` 时可用，用来确认当前屏幕状态；
+  非交互模式下拿不到屏幕内容，只能靠 `send_keys` 试探。
+
+新建 unix shell 时已经写入 `PAGER=cat GIT_PAGER=cat LESS=FRX`，正常情况下分页器不会起来；
+真遇到了说明远端自己重置了这些变量。
+
+## 多行脚本
+
+多行命令不再走 PTY：工具会先经 SFTP 把脚本写到 `/tmp/.mcp_ssh_cmd_<uuid>.sh`，
+回读校验后用 `. <path>` 执行。所以脚本里的 `exit` 会结束会话、`set -e` 会影响后续命令，
+写脚本时注意。

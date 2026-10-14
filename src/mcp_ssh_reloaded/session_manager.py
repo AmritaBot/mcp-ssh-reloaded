@@ -17,12 +17,6 @@ from datetime import datetime
 from typing import Any
 
 import paramiko
-
-try:
-    NoValidConnectionsError = paramiko.NoValidConnectionsError  # pyright: ignore[reportAttributeAccessIssue]
-except AttributeError:
-    pass
-
 import pyte
 
 from .command_executor import CommandExecutor
@@ -146,7 +140,9 @@ class SSHSessionManager:
         await self.connection.close_all_sessions()
 
     def __del__(self):
-        if not hasattr(self, "logger"):
+        if not all(
+            hasattr(self, attr) for attr in ("logger", "connection", "command_executor")
+        ):
             return  # __init__ never completed (e.g. failed during tests)
         self.logger.info("SSHSessionManager destroyed, ensuring cleanup.")
         try:
@@ -154,13 +150,13 @@ class SSHSessionManager:
         except Exception as e:
             self.logger.logger.error(
                 f"Error during __del__ cleanup: {e}", exc_info=True
-            )  # pyright: ignore[reportPossiblyUnboundVariable]
+            )
         try:
             self.command_executor.shutdown()
         except Exception as e:
             self.logger.logger.error(
                 f"Error shutting down executor: {e}", exc_info=True
-            )  # pyright: ignore[reportPossiblyUnboundVariable]
+            )
 
     async def list_sessions(self) -> list[str]:
         return await self.connection.list_sessions()
@@ -428,6 +424,9 @@ class SSHSessionManager:
                 logger.info(f"Recapturing prompt for bash shell on {session_key}")
                 self._capture_prompt(session_key, shell)
 
+        if self.registry.shell_types.get(session_key, "unknown") == "unix_shell":
+            self._configure_shell_environment(session_key, shell)
+
         logger.info(f"New shell for {session_key} is ready")
         return shell
 
@@ -494,7 +493,99 @@ class SSHSessionManager:
         self.registry.shell_types[session_key] = device_type
 
         # Set up prompt pattern based on device type and actual output
-        self._ensure_prompt_pattern(session_key, None, initial_output)  # pyright: ignore[reportArgumentType]
+        self._ensure_prompt_pattern(session_key, None, initial_output)
+
+    _SHELL_ENV_INIT = (
+        "export PAGER=cat GIT_PAGER=cat SYSTEMD_PAGER=cat MANPAGER=cat LESS=FRX; "
+        "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.quotepath "
+        "GIT_CONFIG_VALUE_0=false; "
+        "set +H 2>/dev/null; "
+        "bind 'set enable-bracketed-paste on' 2>/dev/null; "
+        "stty -ixon 2>/dev/null; true"
+    )
+
+    def _configure_shell_environment(
+        self, session_key: str, shell: paramiko.Channel
+    ) -> None:
+        """Disable pagers and drain the echo."""
+        logger = self.logger.getChild("shell_env")
+        try:
+            shell.send((self._SHELL_ENV_INIT + "\n").encode("utf-8"))
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                if shell.recv_ready():
+                    shell.recv(65535)
+                else:
+                    time.sleep(0.05)
+            logger.debug(f"Shell environment configured for {session_key}")
+        except Exception as exc:
+            logger.warning(
+                f"Failed to configure shell environment for {session_key}: {exc}"
+            )
+
+    def _upload_script_via_sftp(
+        self, session_key: str, client: paramiko.SSHClient, script: str
+    ) -> str | None:
+        """Stage a multi-line script over SFTP so it never reaches the PTY."""
+        logger = self.logger.getChild("script_upload")
+        payload = script.encode("utf-8")
+        path = f"/tmp/.mcp_ssh_cmd_{uuid.uuid4().hex[:12]}.sh"
+        try:
+            sftp = client.open_sftp()
+        except Exception as exc:
+            logger.warning(f"SFTP unavailable for {session_key}: {exc}; sending inline")
+            return None
+        try:
+            with sftp.open(path, "wb") as handle:
+                handle.write(payload)
+            with sftp.open(path, "rb") as handle:
+                echoed = handle.read()
+            if echoed != payload:
+                logger.error(
+                    f"Script verification failed for {session_key} "
+                    f"({len(echoed)}/{len(payload)} bytes); sending inline"
+                )
+                return None
+            return path
+        except Exception as exc:
+            logger.warning(f"Failed to stage script for {session_key}: {exc}")
+            return None
+        finally:
+            sftp.close()
+
+    @staticmethod
+    def _condense_for_echo_compare(text: str) -> str:
+        """Collapse whitespace and readline redraw duplication."""
+        out: list[str] = []
+        prev = ""
+        for ch in text:
+            if ch.isspace() or ch == prev:
+                continue
+            out.append(ch)
+            prev = ch
+        return "".join(out)
+
+    def _strip_command_echo(self, output: str, command: str) -> str:
+        """Drop the leading echo of the command, keeping the real output."""
+        if not output or not command:
+            return output
+        cleaned = self._strip_ansi(output)
+        target = self._condense_for_echo_compare(command)
+        if not target:
+            return cleaned
+        lines = cleaned.splitlines()
+        consumed = 0
+        acc = ""
+        for line in lines:
+            if acc == target:
+                break
+            acc += self._condense_for_echo_compare(line)
+            consumed += 1
+            if len(acc) > len(target):
+                return cleaned
+        if acc == target:
+            return "\n".join(lines[consumed:])
+        return cleaned
 
     def _capture_prompt(self, session_key: str, shell: paramiko.Channel) -> str | None:
         """Capture the actual prompt string for this session by sending a marker command.
@@ -740,7 +831,7 @@ class SSHSessionManager:
     def _ensure_prompt_pattern(
         self,
         session_key: str,
-        client: paramiko.SSHClient,
+        client: paramiko.SSHClient | None,
         initial_output: str | None = None,
         shell: paramiko.Channel | None = None,
     ) -> re.Pattern:
@@ -1207,6 +1298,19 @@ class SSHSessionManager:
         if last_line == ":":
             # Common pager prompt when less/most waits for input
             logger.debug("Detected pager ':' prompt")
+            return "pager"
+        # Secondary pager screens.
+        if re.search(r"HELP -- Press RETURN for more", clean_output):
+            logger.debug("Detected less help screen")
+            return "pager"
+        if re.search(r"--More--\s*$", clean_output):
+            logger.debug("Detected more '--More--' prompt")
+            return "pager"
+        if re.search(r"lines \d+-\d+(?:/\d+)?\s*$", clean_output):
+            logger.debug("Detected less status line")
+            return "pager"
+        if re.search(r"Waiting for data\.\.\.", clean_output):
+            logger.debug("Detected pager waiting-for-data screen")
             return "pager"
 
         # MikroTik pager prompt

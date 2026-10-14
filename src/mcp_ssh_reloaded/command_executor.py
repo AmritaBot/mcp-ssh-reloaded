@@ -1722,13 +1722,32 @@ class CommandExecutor:
             # Use sentinel only for Unix-like shells and non-interactive commands
             sentinel = None
             command_to_send = command
+            # Stage multi-line scripts over SFTP, never through the PTY.
+            if is_unix and "\n" in command:
+                script_path = self._sm._upload_script_via_sftp(
+                    session_key, client, command
+                )
+                if script_path:
+                    command_to_send = (
+                        f". {script_path}; __mcp_rc=$?; rm -f {script_path}; "
+                        "(exit $__mcp_rc)"
+                    )
+                    logger.info(f"Multi-line command staged via SFTP: {script_path}")
             # Skip sentinel if command appears to read from stdin (like 'read' command)
             is_interactive_cmd = re.search(r"\bread\b", command)
             if is_unix and not is_interactive_cmd:
                 marker = f"__MCP_CMD_{uuid.uuid4().hex[:8]}__"
-                command_to_send = self._sm._build_command_with_sentinel(command, marker, "")
+                command_to_send = self._sm._build_command_with_sentinel(
+                    command_to_send, marker, ""
+                )
                 sentinel = marker
                 logger.debug(f"Using sentinel marker: {sentinel}")
+
+            def _finalize_stdout(text: str) -> str:
+                """Strip the PTY echo and trailing sentinel."""
+                return self._sm._strip_command_echo(
+                    self._sm._strip_sentinel(text, sentinel), command_to_send
+                ).strip()
 
             logger.info(f"Executing command on {session_key}: {command}")
             shell.send((command_to_send + "\n").encode("utf-8"))
@@ -1792,9 +1811,7 @@ class CommandExecutor:
                 if cancel_event is not None and cancel_event.is_set():
                     logger.info("Execution cancelled by caller")
                     return (
-                        self._sm._strip_sentinel(
-                            "".join(raw_output_chunks), sentinel
-                        ).strip(),
+                        _finalize_stdout("".join(raw_output_chunks)),
                         "Command interrupted",
                         130,
                         None,
@@ -1941,7 +1958,7 @@ class CommandExecutor:
 
                                 # For other types of input (password, etc.), return and let agent handle
                                 return (
-                                    self._sm._strip_sentinel(raw_output, sentinel),
+                                    _finalize_stdout(raw_output),
                                     "",
                                     0,
                                     awaiting,
@@ -2065,7 +2082,7 @@ class CommandExecutor:
                                     del self._sm.registry.shells[session_key]
                                 # Return error indicating session needs reset
                                 return (
-                                    self._sm._strip_sentinel(raw_output, sentinel),
+                                    _finalize_stdout(raw_output),
                                     "Session state corrupted. The session has been reset. Please retry your command.",
                                     1,
                                     None,
@@ -2151,7 +2168,7 @@ class CommandExecutor:
                             )
                             if not is_complete:
                                 return (
-                                    self._sm._strip_sentinel(raw_output, sentinel),
+                                    _finalize_stdout(raw_output),
                                     "",
                                     0,
                                     awaiting,
@@ -2205,7 +2222,7 @@ class CommandExecutor:
             # Final join to ensure all output is returned
             raw_output = "".join(raw_output_chunks)
             return (
-                self._sm._strip_sentinel(raw_output, sentinel).strip(),
+                _finalize_stdout(raw_output),
                 f"Command timed out after {timeout} seconds",
                 124,
                 None,
