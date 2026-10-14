@@ -428,6 +428,10 @@ class SSHSessionManager:
                 logger.info(f"Recapturing prompt for bash shell on {session_key}")
                 self._capture_prompt(session_key, shell)
 
+        # 关掉 pager / git quotepath / 流控，否则 less 会把整个会话卡住
+        if self.registry.shell_types.get(session_key, "unknown") == "unix_shell":
+            self._configure_shell_environment(session_key, shell)
+
         logger.info(f"New shell for {session_key} is ready")
         return shell
 
@@ -495,6 +499,34 @@ class SSHSessionManager:
 
         # Set up prompt pattern based on device type and actual output
         self._ensure_prompt_pattern(session_key, None, initial_output)  # pyright: ignore[reportArgumentType]
+
+    #: 一次性写入 shell 的环境设置。
+    #: PAGER/GIT_PAGER/LESS 关掉分页器，GIT_CONFIG_* 关掉 git 的八进制路径转义，
+    #: stty -ixon 关掉 Ctrl-S 流控（另一个能把会话冻住的老坑）。
+    _SHELL_ENV_INIT = (
+        "export PAGER=cat GIT_PAGER=cat SYSTEMD_PAGER=cat MANPAGER=cat LESS=FRX; "
+        "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.quotepath "
+        "GIT_CONFIG_VALUE_0=false; "
+        "stty -ixon 2>/dev/null; true"
+    )
+
+    def _configure_shell_environment(
+        self, session_key: str, shell: paramiko.Channel
+    ) -> None:
+        """把 shell 调成非交互友好模式，并丢弃回显，避免污染下一条命令的输出。"""
+        try:
+            shell.send((self._SHELL_ENV_INIT + "\n").encode("utf-8"))
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                if shell.recv_ready():
+                    shell.recv(65535)
+                else:
+                    time.sleep(0.05)
+            logger.debug(f"Shell environment configured for {session_key}")
+        except Exception as exc:
+            logger.warning(
+                f"Failed to configure shell environment for {session_key}: {exc}"
+            )
 
     def _capture_prompt(self, session_key: str, shell: paramiko.Channel) -> str | None:
         """Capture the actual prompt string for this session by sending a marker command.
@@ -1207,6 +1239,19 @@ class SSHSessionManager:
         if last_line == ":":
             # Common pager prompt when less/most waits for input
             logger.debug("Detected pager ':' prompt")
+            return "pager"
+        # less 的帮助页、more 的 --More--、less 状态行同样会让会话等输入
+        if re.search(r"HELP -- Press RETURN for more", clean_output):
+            logger.debug("Detected less help screen")
+            return "pager"
+        if re.search(r"--More--\s*$", clean_output):
+            logger.debug("Detected more '--More--' prompt")
+            return "pager"
+        if re.search(r"lines \d+-\d+(?:/\d+)?\s*$", clean_output):
+            logger.debug("Detected less status line")
+            return "pager"
+        if re.search(r"Waiting for data\.\.\.", clean_output):
+            logger.debug("Detected pager waiting-for-data screen")
             return "pager"
 
         # MikroTik pager prompt
