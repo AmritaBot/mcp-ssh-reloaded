@@ -303,6 +303,13 @@ class SSHSessionManager:
         self, session_key: str, client: paramiko.SSHClient
     ) -> paramiko.Channel:
         """Get or create (or recreate) a persistent shell for a session."""
+        with self.registry.shell_init_lock(session_key):
+            return self._create_or_get_shell(session_key, client)
+
+    def _create_or_get_shell(
+        self, session_key: str, client: paramiko.SSHClient
+    ) -> paramiko.Channel:
+        """Create the shell, or return the live one, with setup reads serialised."""
         logger = self.logger.getChild("shell")
 
         if session_key in self.registry.shells:

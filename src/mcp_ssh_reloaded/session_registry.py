@@ -44,6 +44,7 @@ class SessionRegistry:
         self.log_rate_limits: dict[str, float] = {}
 
         self._exec_locks: dict[str, threading.Lock] = {}
+        self._shell_init_locks: dict[str, threading.Lock] = {}
         self._exec_locks_guard = threading.Lock()
 
     # -- read-only views ---------------------------------------------------
@@ -75,6 +76,15 @@ class SessionRegistry:
                 self._exec_locks[session_key] = lock
             return lock
 
+    def shell_init_lock(self, session_key: str) -> threading.Lock:
+        """Return the lock that serialises shell creation for one session."""
+        with self._exec_locks_guard:
+            lock = self._shell_init_locks.get(session_key)
+            if lock is None:
+                lock = threading.Lock()
+                self._shell_init_locks[session_key] = lock
+            return lock
+
     # -- lifecycle ---------------------------------------------------------
 
     def forget(self, session_key: str) -> None:
@@ -93,6 +103,8 @@ class SessionRegistry:
             # Keep the lock while a worker holds it, or a reader could slip in.
             if lock is None or not lock.locked():
                 self._exec_locks.pop(session_key, None)
+        with self._exec_locks_guard:
+            self._shell_init_locks.pop(session_key, None)
         for key in [
             k
             for k in list(self.log_rate_limits.keys())
@@ -116,3 +128,4 @@ class SessionRegistry:
         self.log_rate_limits.clear()
         with self._exec_locks_guard:
             self._exec_locks.clear()
+            self._shell_init_locks.clear()

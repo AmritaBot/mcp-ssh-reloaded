@@ -844,6 +844,21 @@ class CommandExecutor:
             logger.error(f"Error retrieving exit code: {e}")
             return 0
 
+    def _osc633_exit(self, cmd: RunningCommand) -> int | None:
+        """Return the exit code the shell reported, trimming the marker from the output."""
+        nonce = self._sm.osc633_nonce(cmd.session_key)
+        if not nonce:
+            return None
+        found = find_completion(cmd.stdout + "".join(cmd.output_chunks), nonce)
+        if found is None:
+            return None
+        with self._lock:
+            if cmd.output_chunks:
+                cmd.stdout += "".join(cmd.output_chunks)
+                cmd.output_chunks = []
+        cmd.stdout = cmd.stdout[: found[0]]
+        return found[1]
+
     def _continue_monitoring_timeout_background(
         self,
         command_id: str,
@@ -995,6 +1010,22 @@ class CommandExecutor:
                                             cmd.awaiting_input_reason = awaiting
                                     return
 
+                                reported = self._osc633_exit(cmd)
+
+                                if reported is not None:
+
+                                    with self._lock:
+
+                                        if command_id in self._commands:
+
+                                            cmd.status = CommandStatus.COMPLETED
+
+                                            cmd.exit_code = reported
+
+                                    return
+
+
+
                                 # Check for sentinel if one was used
                                 if cmd.sentinel and cmd.sentinel in cmd.stdout:
                                     logger.info(
@@ -1055,6 +1086,22 @@ class CommandExecutor:
                                 if command_id in self._commands and cmd.output_chunks:
                                     cmd.stdout += "".join(cmd.output_chunks)
                                     cmd.output_chunks = []
+
+                            reported = self._osc633_exit(cmd)
+
+                            if reported is not None:
+
+                                with self._lock:
+
+                                    if command_id in self._commands:
+
+                                        cmd.status = CommandStatus.COMPLETED
+
+                                        cmd.exit_code = reported
+
+                                return
+
+
 
                             # Check for sentinel if one was used
                             if cmd.sentinel and cmd.sentinel in cmd.stdout:
@@ -1240,6 +1287,22 @@ class CommandExecutor:
                                         cmd.stdout += "".join(cmd.output_chunks)
                                         cmd.output_chunks = []
 
+                                reported = self._osc633_exit(cmd)
+
+                                if reported is not None:
+
+                                    with self._lock:
+
+                                        if command_id in self._commands:
+
+                                            cmd.status = CommandStatus.COMPLETED
+
+                                            cmd.exit_code = reported
+
+                                    return
+
+
+
                                 # Check for sentinel if one was used
                                 if cmd.sentinel and cmd.sentinel in cmd.stdout:
                                     logger.info(
@@ -1314,6 +1377,22 @@ class CommandExecutor:
                                 if command_id in self._commands and cmd.output_chunks:
                                     cmd.stdout += "".join(cmd.output_chunks)
                                     cmd.output_chunks = []
+
+                            reported = self._osc633_exit(cmd)
+
+                            if reported is not None:
+
+                                with self._lock:
+
+                                    if command_id in self._commands:
+
+                                        cmd.status = CommandStatus.COMPLETED
+
+                                        cmd.exit_code = reported
+
+                                return
+
+
 
                             # Check for sentinel if one was used
                             if cmd.sentinel and cmd.sentinel in cmd.stdout:
