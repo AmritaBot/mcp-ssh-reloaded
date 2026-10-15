@@ -29,6 +29,7 @@ from .logging_manager import get_context_logger, get_logger
 from .models import FileContent
 from .session_diagnostics import ConnectionProfileManager, SessionDiagnosticsProvider
 from .session_registry import SessionRegistry
+from .shell_integration import OSC633_INSTALL_SCRIPT, has_marker
 from .validation import CommandValidator
 
 
@@ -415,6 +416,7 @@ class SSHSessionManager:
 
         if self.registry.shell_types.get(session_key, "unknown") == "unix_shell":
             self._configure_shell_environment(session_key, shell)
+            self._install_osc633(session_key, client, shell)
 
         logger.info(f"New shell for {session_key} is ready")
         return shell
@@ -511,6 +513,42 @@ class SSHSessionManager:
             logger.warning(
                 f"Failed to configure shell environment for {session_key}: {exc}"
             )
+
+    def is_osc633(self, session_key: str) -> bool:
+        """Whether this session reports completion through OSC 633 markers."""
+        return self.registry.osc633.get(session_key, False)
+
+    def _install_osc633(
+        self, session_key: str, client: paramiko.SSHClient, shell: paramiko.Channel
+    ) -> bool:
+        """Install OSC 633 markers, leaving the session on sentinels when unsupported."""
+        logger = self.logger.getChild("osc633")
+        path = self._upload_script_via_sftp(session_key, client, OSC633_INSTALL_SCRIPT)
+        if not path:
+            logger.info(f"OSC 633 unavailable for {session_key}: staging failed")
+            self.registry.osc633[session_key] = False
+            return False
+        try:
+            while shell.recv_ready():
+                shell.recv(65535)
+            shell.send(f". {path}; rm -f {path}\n".encode())
+            seen = ""
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                if shell.recv_ready():
+                    seen += shell.recv(65535).decode("utf-8", errors="ignore")
+                    if has_marker(seen):
+                        break
+                else:
+                    time.sleep(0.05)
+            active = has_marker(seen)
+            self.registry.osc633[session_key] = active
+            logger.info(f"OSC 633 for {session_key}: {'on' if active else 'off'}")
+            return active
+        except Exception as exc:
+            logger.warning(f"OSC 633 install failed for {session_key}: {exc}")
+            self.registry.osc633[session_key] = False
+            return False
 
     def _upload_script_via_sftp(
         self, session_key: str, client: paramiko.SSHClient, script: str

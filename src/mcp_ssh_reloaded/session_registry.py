@@ -40,6 +40,7 @@ class SessionRegistry:
         self.emulators: dict[str, tuple[pyte.Screen, pyte.Stream]] = {}
         self.modes: dict[str, str] = {}
         self.active_commands: dict[str, Any] = {}
+        self.osc633: dict[str, bool] = {}
         self.log_rate_limits: dict[str, float] = {}
 
         self._exec_locks: dict[str, threading.Lock] = {}
@@ -85,6 +86,7 @@ class SessionRegistry:
         self.emulators.pop(session_key, None)
         self.modes.pop(session_key, None)
         self.active_commands.pop(session_key, None)
+        self.osc633.pop(session_key, None)
         self.enable_mode.pop(session_key, None)
         with self._exec_locks_guard:
             lock = self._exec_locks.get(session_key)
@@ -110,6 +112,7 @@ class SessionRegistry:
         self.emulators.clear()
         self.modes.clear()
         self.active_commands.clear()
+        self.osc633.clear()
         self.log_rate_limits.clear()
         with self._exec_locks_guard:
             self._exec_locks.clear()

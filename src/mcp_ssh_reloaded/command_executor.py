@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 from .models import CommandStatus, ExecutionResult, RunningCommand
 from .output_buffer import OutputBuffer
+from .shell_integration import completion
 
 
 def _result_from_legacy(
@@ -1696,6 +1697,7 @@ class CommandExecutor:
             shell_type = self._sm.registry.shell_types.get(session_key, "unknown")
             logger.debug(f"Shell type for {session_key}: {shell_type}")
             is_unix = shell_type == "unix_shell"
+            osc633 = is_unix and self._sm.is_osc633(session_key) and not context_changing
 
             # Use sentinel only for Unix-like shells and non-interactive commands
             sentinel = None
@@ -1713,7 +1715,7 @@ class CommandExecutor:
                     logger.info(f"Multi-line command staged via SFTP: {script_path}")
             # Skip sentinel if command appears to read from stdin (like 'read' command)
             is_interactive_cmd = re.search(r"\bread\b", command)
-            if is_unix and not is_interactive_cmd:
+            if is_unix and not is_interactive_cmd and not osc633:
                 marker = f"__MCP_CMD_{uuid.uuid4().hex[:8]}__"
                 command_to_send = self._sm._build_command_with_sentinel(
                     command_to_send, marker, ""
@@ -1784,6 +1786,7 @@ class CommandExecutor:
 
             output_buffer = output_buffer or self._new_output_buffer()
             raw_output_chunks = []
+            marker_carry = ""
 
             while time.time() - start_time < timeout:
                 if cancel_event is not None and cancel_event.is_set():
@@ -1802,6 +1805,23 @@ class CommandExecutor:
                     last_recv_time = time.time()
                     limited_chunk, should_continue = output_buffer.add_chunk(chunk)
                     raw_output_chunks.append(limited_chunk)
+
+                    if osc633:
+                        window = marker_carry + chunk
+                        marker_carry = chunk[-64:]
+                        if completion(window) is not None:
+                            joined = "".join(raw_output_chunks)
+                            found = completion(joined)
+                            if found is not None:
+                                cut, reported = found
+                                logger.debug(f"OSC 633 reported exit code {reported}")
+                                return (
+                                    _finalize_stdout(joined[:cut]),
+                                    "",
+                                    reported,
+                                    None,
+                                    sentinel,
+                                )
 
                     # Probe for prompts on small chunks or after accumulation.
                     should_check = False
@@ -1969,8 +1989,8 @@ class CommandExecutor:
                         )
 
                         # With a sentinel active, ignore prompt matches: "Cost is 10$" fakes one.
-                        if sentinel and is_complete:
-                            # Trust the sentinel; never return on prompt detection alone.
+                        if (sentinel or osc633) and is_complete:
+                            # Trust the shell's own marker; never return on a guessed prompt.
                             is_complete = False
                     else:
                         is_complete = False
@@ -2147,15 +2167,14 @@ class CommandExecutor:
                                 "Prompt found in cleaned output during idle timeout"
                             )
 
-                            # If sentinel is active, verify sentinel presence even on idle timeout
-                            if sentinel:
-                                if sentinel in raw_output:
+                            # With a marker active, never complete on a guessed prompt
+                            if sentinel or osc633:
+                                if sentinel and sentinel in raw_output:
                                     # Sentinel found: let the main loop finish it next iteration.
                                     pass
                                 else:
-                                    # Prompt but no sentinel: favour a false negative over a false positive.
                                     logger.debug(
-                                        "Sentinel active but not found - ignoring prompt detection on idle"
+                                        "Marker active but not seen - ignoring prompt detection on idle"
                                     )
                                     is_complete = False
 
