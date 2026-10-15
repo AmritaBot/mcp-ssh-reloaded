@@ -856,7 +856,7 @@ class CommandExecutor:
             if cmd.output_chunks:
                 cmd.stdout += "".join(cmd.output_chunks)
                 cmd.output_chunks = []
-        cmd.stdout = cmd.stdout[: found[0]]
+        cmd.stdout = self._sm._strip_ansi(cmd.stdout[: found[0]])
         return found[1]
 
     def _continue_monitoring_timeout_background(
@@ -1024,8 +1024,6 @@ class CommandExecutor:
 
                                     return
 
-
-
                                 # Check for sentinel if one was used
                                 if cmd.sentinel and cmd.sentinel in cmd.stdout:
                                     logger.info(
@@ -1100,8 +1098,6 @@ class CommandExecutor:
                                         cmd.exit_code = reported
 
                                 return
-
-
 
                             # Check for sentinel if one was used
                             if cmd.sentinel and cmd.sentinel in cmd.stdout:
@@ -1301,8 +1297,6 @@ class CommandExecutor:
 
                                     return
 
-
-
                                 # Check for sentinel if one was used
                                 if cmd.sentinel and cmd.sentinel in cmd.stdout:
                                     logger.info(
@@ -1391,8 +1385,6 @@ class CommandExecutor:
                                         cmd.exit_code = reported
 
                                 return
-
-
 
                             # Check for sentinel if one was used
                             if cmd.sentinel and cmd.sentinel in cmd.stdout:
@@ -1599,6 +1591,27 @@ class CommandExecutor:
         cancel_event: threading.Event | None = None,
         output_buffer: OutputBuffer | None = None,
     ) -> tuple[str, str, int]:
+        """Run a sudo command and drop PTY leftovers from the returned output."""
+        stdout, stderr, exit_code = self._run_sudo_command(
+            client,
+            command,
+            sudo_password,
+            timeout,
+            cancel_event=cancel_event,
+            output_buffer=output_buffer,
+        )
+        return self._sm._scrub_sentinel_noise(stdout), stderr, exit_code
+
+    def _run_sudo_command(
+        self,
+        client: paramiko.SSHClient,
+        command: str,
+        sudo_password: str,
+        timeout: int = 30,
+        *,
+        cancel_event: threading.Event | None = None,
+        output_buffer: OutputBuffer | None = None,
+    ) -> tuple[str, str, int]:
         """Execute a sudo command using the persistent shell, handling password prompts.
 
         Uses the persistent shell from the session to maintain state and benefit from
@@ -1627,6 +1640,14 @@ class CommandExecutor:
             # Get the persistent shell
             shell = self._sm._get_or_create_shell(session_key, client)
             shell.settimeout(timeout)
+
+            # Drop leftovers from the previous command before sending this one
+            if shell.recv_ready():
+                try:
+                    while shell.recv_ready():
+                        shell.recv(4096)
+                except Exception:
+                    pass
 
             # Send the command
             shell.send((command + "\n").encode("utf-8"))

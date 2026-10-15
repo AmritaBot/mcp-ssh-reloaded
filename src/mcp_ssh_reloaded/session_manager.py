@@ -609,6 +609,18 @@ class SSHSessionManager:
             prev = ch
         return "".join(out)
 
+    @staticmethod
+    def _scrub_sentinel_noise(text: str) -> str:
+        """Drop echoed sentinel plumbing a PTY left behind for the next reader."""
+        if "__mcp_status=$?" not in text and "__MCP_CMD_" not in text:
+            return text
+        lines = [
+            line
+            for line in text.splitlines()
+            if "__mcp_status=$?" not in line and "__MCP_CMD_" not in line
+        ]
+        return "\n".join(lines).strip()
+
     def _strip_command_echo(self, output: str, command: str) -> str:
         """Drop the leading echo of the command, keeping the real output."""
         if not output or not command:
