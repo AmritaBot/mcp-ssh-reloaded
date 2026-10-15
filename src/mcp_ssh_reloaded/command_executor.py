@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 from .models import CommandStatus, ExecutionResult, RunningCommand
 from .output_buffer import OutputBuffer
-from .shell_integration import completion
+from .shell_integration import feed, find_completion
 
 
 def _result_from_legacy(
@@ -1698,6 +1698,7 @@ class CommandExecutor:
             logger.debug(f"Shell type for {session_key}: {shell_type}")
             is_unix = shell_type == "unix_shell"
             osc633 = is_unix and self._sm.is_osc633(session_key) and not context_changing
+            nonce = self._sm.osc633_nonce(session_key) if osc633 else ""
 
             # Use sentinel only for Unix-like shells and non-interactive commands
             sentinel = None
@@ -1806,23 +1807,6 @@ class CommandExecutor:
                     limited_chunk, should_continue = output_buffer.add_chunk(chunk)
                     raw_output_chunks.append(limited_chunk)
 
-                    if osc633:
-                        window = marker_carry + chunk
-                        marker_carry = chunk[-64:]
-                        if completion(window) is not None:
-                            joined = "".join(raw_output_chunks)
-                            found = completion(joined)
-                            if found is not None:
-                                cut, reported = found
-                                logger.debug(f"OSC 633 reported exit code {reported}")
-                                return (
-                                    _finalize_stdout(joined[:cut]),
-                                    "",
-                                    reported,
-                                    None,
-                                    sentinel,
-                                )
-
                     # Probe for prompts on small chunks or after accumulation.
                     should_check = False
                     if len(chunk) < 100:  # Small chunks often contain prompts
@@ -1859,6 +1843,25 @@ class CommandExecutor:
                             None,
                             sentinel,
                         )
+
+                    if osc633:
+                        marker_carry, reported = feed(marker_carry, chunk, nonce)
+                        if reported is not None:
+                            joined = "".join(raw_output_chunks)
+                            found = find_completion(joined, nonce)
+                            body = (
+                                joined[: found[0]]
+                                if found
+                                else output_buffer.render(joined)
+                            )
+                            logger.debug(f"OSC 633 reported exit code {reported}")
+                            return (
+                                _finalize_stdout(body),
+                                "",
+                                reported,
+                                None,
+                                sentinel,
+                            )
 
                     if should_check:
                         # Check for interactive prompts BEFORE checking for completion
@@ -2009,6 +2012,7 @@ class CommandExecutor:
                             with self._sm.registry.lock:
                                 self._sm.registry.prompts.pop(session_key, None)
                             self._sm._capture_prompt(session_key, shell)
+                            self._sm._install_osc633(session_key, client, shell)
 
                         return cleaned_output, "", 0, None, sentinel
 
@@ -2043,6 +2047,7 @@ class CommandExecutor:
 
                                 # Try to recapture prompt
                                 self._sm._capture_prompt(session_key, shell)
+                                self._sm._install_osc633(session_key, client, shell)
                                 self._sm._ensure_prompt_pattern(
                                     session_key, client, raw_output, shell
                                 )
@@ -2187,6 +2192,7 @@ class CommandExecutor:
                                 with self._sm.registry.lock:
                                     self._sm.registry.prompts.pop(session_key, None)
                                 self._sm._capture_prompt(session_key, shell)
+                                self._sm._install_osc633(session_key, client, shell)
 
                             return cleaned_output, "", 0, None, sentinel
                     time.sleep(0.1)

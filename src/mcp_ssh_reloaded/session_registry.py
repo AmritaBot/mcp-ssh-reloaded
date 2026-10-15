@@ -40,7 +40,7 @@ class SessionRegistry:
         self.emulators: dict[str, tuple[pyte.Screen, pyte.Stream]] = {}
         self.modes: dict[str, str] = {}
         self.active_commands: dict[str, Any] = {}
-        self.osc633: dict[str, bool] = {}
+        self.osc633: dict[str, str] = {}
         self.log_rate_limits: dict[str, float] = {}
 
         self._exec_locks: dict[str, threading.Lock] = {}
