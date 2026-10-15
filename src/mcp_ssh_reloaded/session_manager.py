@@ -29,6 +29,7 @@ from .logging_manager import get_context_logger, get_logger
 from .models import FileContent
 from .session_diagnostics import ConnectionProfileManager, SessionDiagnosticsProvider
 from .session_registry import SessionRegistry
+from .shell_integration import build_install_script, has_marker, new_nonce
 from .validation import CommandValidator
 
 
@@ -302,6 +303,13 @@ class SSHSessionManager:
         self, session_key: str, client: paramiko.SSHClient
     ) -> paramiko.Channel:
         """Get or create (or recreate) a persistent shell for a session."""
+        with self.registry.shell_init_lock(session_key):
+            return self._create_or_get_shell(session_key, client)
+
+    def _create_or_get_shell(
+        self, session_key: str, client: paramiko.SSHClient
+    ) -> paramiko.Channel:
+        """Create the shell, or return the live one, with setup reads serialised."""
         logger = self.logger.getChild("shell")
 
         if session_key in self.registry.shells:
@@ -415,6 +423,7 @@ class SSHSessionManager:
 
         if self.registry.shell_types.get(session_key, "unknown") == "unix_shell":
             self._configure_shell_environment(session_key, shell)
+            self._install_osc633(session_key, client, shell)
 
         logger.info(f"New shell for {session_key} is ready")
         return shell
@@ -512,6 +521,52 @@ class SSHSessionManager:
                 f"Failed to configure shell environment for {session_key}: {exc}"
             )
 
+    def is_osc633(self, session_key: str) -> bool:
+        """Whether this session reports completion through OSC 633 markers."""
+        return bool(self.registry.osc633.get(session_key))
+
+    def osc633_nonce(self, session_key: str) -> str:
+        """Return the nonce this session's markers carry, or an empty string."""
+        return self.registry.osc633.get(session_key, "")
+
+    def _install_osc633(
+        self, session_key: str, client: paramiko.SSHClient, shell: paramiko.Channel
+    ) -> bool:
+        """Install OSC 633 markers, leaving the session on sentinels when unsupported."""
+        logger = self.logger.getChild("osc633")
+        nonce = new_nonce()
+        path = self._upload_script_via_sftp(
+            session_key, client, build_install_script(nonce)
+        )
+        if not path:
+            logger.info(f"OSC 633 unavailable for {session_key}: staging failed")
+            self.registry.osc633.pop(session_key, None)
+            return False
+        try:
+            while shell.recv_ready():
+                shell.recv(65535)
+            shell.send(f". {path}; rm -f {path}\n".encode())
+            seen = ""
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                if shell.recv_ready():
+                    seen += shell.recv(65535).decode("utf-8", errors="ignore")
+                    if has_marker(seen, nonce):
+                        break
+                else:
+                    time.sleep(0.05)
+            active = has_marker(seen, nonce)
+            if active:
+                self.registry.osc633[session_key] = nonce
+            else:
+                self.registry.osc633.pop(session_key, None)
+            logger.info(f"OSC 633 for {session_key}: {'on' if active else 'off'}")
+            return active
+        except Exception as exc:
+            logger.warning(f"OSC 633 install failed for {session_key}: {exc}")
+            self.registry.osc633.pop(session_key, None)
+            return False
+
     def _upload_script_via_sftp(
         self, session_key: str, client: paramiko.SSHClient, script: str
     ) -> str | None:
@@ -553,6 +608,18 @@ class SSHSessionManager:
             out.append(ch)
             prev = ch
         return "".join(out)
+
+    @staticmethod
+    def _scrub_sentinel_noise(text: str) -> str:
+        """Drop echoed sentinel plumbing a PTY left behind for the next reader."""
+        if "__mcp_status=$?" not in text and "__MCP_CMD_" not in text:
+            return text
+        lines = [
+            line
+            for line in text.splitlines()
+            if "__mcp_status=$?" not in line and "__MCP_CMD_" not in line
+        ]
+        return "\n".join(lines).strip()
 
     def _strip_command_echo(self, output: str, command: str) -> str:
         """Drop the leading echo of the command, keeping the real output."""

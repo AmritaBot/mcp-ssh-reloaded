@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 from .models import CommandStatus, ExecutionResult, RunningCommand
 from .output_buffer import OutputBuffer
+from .shell_integration import feed, find_completion
 
 
 def _result_from_legacy(
@@ -843,6 +844,21 @@ class CommandExecutor:
             logger.error(f"Error retrieving exit code: {e}")
             return 0
 
+    def _osc633_exit(self, cmd: RunningCommand) -> int | None:
+        """Return the exit code the shell reported, trimming the marker from the output."""
+        nonce = self._sm.osc633_nonce(cmd.session_key)
+        if not nonce:
+            return None
+        found = find_completion(cmd.stdout + "".join(cmd.output_chunks), nonce)
+        if found is None:
+            return None
+        with self._lock:
+            if cmd.output_chunks:
+                cmd.stdout += "".join(cmd.output_chunks)
+                cmd.output_chunks = []
+        cmd.stdout = self._sm._strip_ansi(cmd.stdout[: found[0]])
+        return found[1]
+
     def _continue_monitoring_timeout_background(
         self,
         command_id: str,
@@ -994,6 +1010,20 @@ class CommandExecutor:
                                             cmd.awaiting_input_reason = awaiting
                                     return
 
+                                reported = self._osc633_exit(cmd)
+
+                                if reported is not None:
+
+                                    with self._lock:
+
+                                        if command_id in self._commands:
+
+                                            cmd.status = CommandStatus.COMPLETED
+
+                                            cmd.exit_code = reported
+
+                                    return
+
                                 # Check for sentinel if one was used
                                 if cmd.sentinel and cmd.sentinel in cmd.stdout:
                                     logger.info(
@@ -1054,6 +1084,20 @@ class CommandExecutor:
                                 if command_id in self._commands and cmd.output_chunks:
                                     cmd.stdout += "".join(cmd.output_chunks)
                                     cmd.output_chunks = []
+
+                            reported = self._osc633_exit(cmd)
+
+                            if reported is not None:
+
+                                with self._lock:
+
+                                    if command_id in self._commands:
+
+                                        cmd.status = CommandStatus.COMPLETED
+
+                                        cmd.exit_code = reported
+
+                                return
 
                             # Check for sentinel if one was used
                             if cmd.sentinel and cmd.sentinel in cmd.stdout:
@@ -1239,6 +1283,20 @@ class CommandExecutor:
                                         cmd.stdout += "".join(cmd.output_chunks)
                                         cmd.output_chunks = []
 
+                                reported = self._osc633_exit(cmd)
+
+                                if reported is not None:
+
+                                    with self._lock:
+
+                                        if command_id in self._commands:
+
+                                            cmd.status = CommandStatus.COMPLETED
+
+                                            cmd.exit_code = reported
+
+                                    return
+
                                 # Check for sentinel if one was used
                                 if cmd.sentinel and cmd.sentinel in cmd.stdout:
                                     logger.info(
@@ -1313,6 +1371,20 @@ class CommandExecutor:
                                 if command_id in self._commands and cmd.output_chunks:
                                     cmd.stdout += "".join(cmd.output_chunks)
                                     cmd.output_chunks = []
+
+                            reported = self._osc633_exit(cmd)
+
+                            if reported is not None:
+
+                                with self._lock:
+
+                                    if command_id in self._commands:
+
+                                        cmd.status = CommandStatus.COMPLETED
+
+                                        cmd.exit_code = reported
+
+                                return
 
                             # Check for sentinel if one was used
                             if cmd.sentinel and cmd.sentinel in cmd.stdout:
@@ -1519,6 +1591,27 @@ class CommandExecutor:
         cancel_event: threading.Event | None = None,
         output_buffer: OutputBuffer | None = None,
     ) -> tuple[str, str, int]:
+        """Run a sudo command and drop PTY leftovers from the returned output."""
+        stdout, stderr, exit_code = self._run_sudo_command(
+            client,
+            command,
+            sudo_password,
+            timeout,
+            cancel_event=cancel_event,
+            output_buffer=output_buffer,
+        )
+        return self._sm._scrub_sentinel_noise(stdout), stderr, exit_code
+
+    def _run_sudo_command(
+        self,
+        client: paramiko.SSHClient,
+        command: str,
+        sudo_password: str,
+        timeout: int = 30,
+        *,
+        cancel_event: threading.Event | None = None,
+        output_buffer: OutputBuffer | None = None,
+    ) -> tuple[str, str, int]:
         """Execute a sudo command using the persistent shell, handling password prompts.
 
         Uses the persistent shell from the session to maintain state and benefit from
@@ -1547,6 +1640,14 @@ class CommandExecutor:
             # Get the persistent shell
             shell = self._sm._get_or_create_shell(session_key, client)
             shell.settimeout(timeout)
+
+            # Drop leftovers from the previous command before sending this one
+            if shell.recv_ready():
+                try:
+                    while shell.recv_ready():
+                        shell.recv(4096)
+                except Exception:
+                    pass
 
             # Send the command
             shell.send((command + "\n").encode("utf-8"))
@@ -1696,6 +1797,8 @@ class CommandExecutor:
             shell_type = self._sm.registry.shell_types.get(session_key, "unknown")
             logger.debug(f"Shell type for {session_key}: {shell_type}")
             is_unix = shell_type == "unix_shell"
+            osc633 = is_unix and self._sm.is_osc633(session_key) and not context_changing
+            nonce = self._sm.osc633_nonce(session_key) if osc633 else ""
 
             # Use sentinel only for Unix-like shells and non-interactive commands
             sentinel = None
@@ -1713,7 +1816,7 @@ class CommandExecutor:
                     logger.info(f"Multi-line command staged via SFTP: {script_path}")
             # Skip sentinel if command appears to read from stdin (like 'read' command)
             is_interactive_cmd = re.search(r"\bread\b", command)
-            if is_unix and not is_interactive_cmd:
+            if is_unix and not is_interactive_cmd and not osc633:
                 marker = f"__MCP_CMD_{uuid.uuid4().hex[:8]}__"
                 command_to_send = self._sm._build_command_with_sentinel(
                     command_to_send, marker, ""
@@ -1784,6 +1887,7 @@ class CommandExecutor:
 
             output_buffer = output_buffer or self._new_output_buffer()
             raw_output_chunks = []
+            marker_carry = ""
 
             while time.time() - start_time < timeout:
                 if cancel_event is not None and cancel_event.is_set():
@@ -1839,6 +1943,25 @@ class CommandExecutor:
                             None,
                             sentinel,
                         )
+
+                    if osc633:
+                        marker_carry, reported = feed(marker_carry, chunk, nonce)
+                        if reported is not None:
+                            joined = "".join(raw_output_chunks)
+                            found = find_completion(joined, nonce)
+                            body = (
+                                joined[: found[0]]
+                                if found
+                                else output_buffer.render(joined)
+                            )
+                            logger.debug(f"OSC 633 reported exit code {reported}")
+                            return (
+                                _finalize_stdout(body),
+                                "",
+                                reported,
+                                None,
+                                sentinel,
+                            )
 
                     if should_check:
                         # Check for interactive prompts BEFORE checking for completion
@@ -1969,8 +2092,8 @@ class CommandExecutor:
                         )
 
                         # With a sentinel active, ignore prompt matches: "Cost is 10$" fakes one.
-                        if sentinel and is_complete:
-                            # Trust the sentinel; never return on prompt detection alone.
+                        if (sentinel or osc633) and is_complete:
+                            # Trust the shell's own marker; never return on a guessed prompt.
                             is_complete = False
                     else:
                         is_complete = False
@@ -1989,6 +2112,7 @@ class CommandExecutor:
                             with self._sm.registry.lock:
                                 self._sm.registry.prompts.pop(session_key, None)
                             self._sm._capture_prompt(session_key, shell)
+                            self._sm._install_osc633(session_key, client, shell)
 
                         return cleaned_output, "", 0, None, sentinel
 
@@ -2023,6 +2147,7 @@ class CommandExecutor:
 
                                 # Try to recapture prompt
                                 self._sm._capture_prompt(session_key, shell)
+                                self._sm._install_osc633(session_key, client, shell)
                                 self._sm._ensure_prompt_pattern(
                                     session_key, client, raw_output, shell
                                 )
@@ -2147,15 +2272,14 @@ class CommandExecutor:
                                 "Prompt found in cleaned output during idle timeout"
                             )
 
-                            # If sentinel is active, verify sentinel presence even on idle timeout
-                            if sentinel:
-                                if sentinel in raw_output:
+                            # With a marker active, never complete on a guessed prompt
+                            if sentinel or osc633:
+                                if sentinel and sentinel in raw_output:
                                     # Sentinel found: let the main loop finish it next iteration.
                                     pass
                                 else:
-                                    # Prompt but no sentinel: favour a false negative over a false positive.
                                     logger.debug(
-                                        "Sentinel active but not found - ignoring prompt detection on idle"
+                                        "Marker active but not seen - ignoring prompt detection on idle"
                                     )
                                     is_complete = False
 
@@ -2168,6 +2292,7 @@ class CommandExecutor:
                                 with self._sm.registry.lock:
                                     self._sm.registry.prompts.pop(session_key, None)
                                 self._sm._capture_prompt(session_key, shell)
+                                self._sm._install_osc633(session_key, client, shell)
 
                             return cleaned_output, "", 0, None, sentinel
                     time.sleep(0.1)
