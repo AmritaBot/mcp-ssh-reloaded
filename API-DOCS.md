@@ -186,7 +186,7 @@ Tunables for `SSHService`. Powered by **Pydantic `BaseSettings`** - reads `MCP_S
 | `normal_idle_timeout`            | `int`  | `2`                           | `MCP_SSH_NORMAL_IDLE_TIMEOUT`            | Normal command idle timeout            |
 | `package_manager_idle_timeout`   | `int`  | `10`                          | `MCP_SSH_PACKAGE_MANAGER_IDLE_TIMEOUT`   | Package manager idle timeout           |
 | `async_default_timeout`          | `int`  | `30`                          | `MCP_SSH_ASYNC_DEFAULT_TIMEOUT`          | Async command default timeout          |
-| `single_session`                 | `bool` | `True`                        | `MCP_SSH_SINGLE_SESSION`                 | One host at a time; a second is refused |
+| `single_session`                 | `bool` | `False`                       | `MCP_SSH_SINGLE_SESSION`                 | Opt-in: one host at a time; a second is refused |
 
 ```python
 # Env var
