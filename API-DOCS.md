@@ -186,6 +186,7 @@ Tunables for `SSHService`. Powered by **Pydantic `BaseSettings`** - reads `MCP_S
 | `normal_idle_timeout`            | `int`  | `2`                           | `MCP_SSH_NORMAL_IDLE_TIMEOUT`            | Normal command idle timeout            |
 | `package_manager_idle_timeout`   | `int`  | `10`                          | `MCP_SSH_PACKAGE_MANAGER_IDLE_TIMEOUT`   | Package manager idle timeout           |
 | `async_default_timeout`          | `int`  | `30`                          | `MCP_SSH_ASYNC_DEFAULT_TIMEOUT`          | Async command default timeout          |
+| `single_session`                 | `bool` | `True`                        | `MCP_SSH_SINGLE_SESSION`                 | One host at a time; a second is refused |
 
 ```python
 # Env var
@@ -371,6 +372,23 @@ def reset_prompt(self, conn: ConnectionParams) -> bool
 ```
 
 Re-detect the shell prompt after context-changing commands (e.g., `ssh` to another host, `sudo -i`).
+
+### `probe`
+
+```python
+async def probe(self, conn: ConnectionParams) -> str
+```
+
+Describe the target host (OS, kernel, arch, distro, login user, shell, sudo path) and
+this tool's own name and version. Addresses are never returned: anything IP-shaped
+comes back as `[redacted]`.
+
+### Long output
+
+A stream that outgrows the inline window (40 KB) is not echoed back. The result carries
+a head+tail summary plus a `spilled_path`, and the whole stream is on disk at
+`<log_dir>/<command_id>/content.txt` on the host running this server. Read it back with
+`read_file` when that host is reachable, or from its filesystem directly.
 
 ### `get_health_report` / `get_perf_metrics`
 

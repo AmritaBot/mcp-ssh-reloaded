@@ -121,6 +121,23 @@ async def execute_command(
 
 
 @mcp.tool()
+async def probe(
+    host: str,
+    username: str | None = None,
+    password: str | None = None,
+    key_filename: str | None = None,
+    port: int | None = None,
+) -> str:
+    """Report what the target host is and what this tool is, without any address."""
+    try:
+        return await _service().probe(
+            _conn(host, username, password, key_filename, port)
+        )
+    except Exception as e:
+        return _fmt_error(e)
+
+
+@mcp.tool()
 async def list_sessions() -> str:
     """List all active SSH sessions."""
     sessions = await _service().list_sessions()

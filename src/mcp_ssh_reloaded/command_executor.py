@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import logging
+import os
 import re
 import threading
 import time
@@ -125,11 +126,15 @@ class CommandExecutor:
         r"\braspi-config\b",
     ]
 
-    def _new_output_buffer(self) -> OutputBuffer:
-        """Buffer honouring the configured output cap and spill directory."""
+    def _new_output_buffer(self, command_id: str | None = None) -> OutputBuffer:
+        """Buffer honouring the configured output cap, spilling under the log dir."""
+        spill_path = None
+        if command_id:
+            spill_path = os.path.join(self.config.log_dir, command_id, "content.txt")
         return OutputBuffer(
             max_size=self.config.max_output_bytes,
             spill_dir=self.config.log_dir,
+            spill_path=spill_path,
         )
 
     def _mark_interpreter_exit(self):
@@ -476,7 +481,7 @@ class CommandExecutor:
         # Only one read loop may hold a session's shell at a time.
         exec_lock = self._sm.registry.execution_lock(session_key)
         exec_lock.acquire()
-        output_buffer = self._new_output_buffer()
+        output_buffer = self._new_output_buffer(command_id)
         try:
             with self._lock:
                 if command_id not in self._commands:
@@ -883,7 +888,7 @@ class CommandExecutor:
         start_time = time.time()
 
         # Seed the buffer so a spill file really does hold the whole stream.
-        output_buffer = self._new_output_buffer()
+        output_buffer = self._new_output_buffer(command_id)
         output_buffer.add_chunk(cmd.stdout)
 
         last_log_time = 0.0
@@ -1197,7 +1202,7 @@ class CommandExecutor:
         start_time = time.time()
 
         # Seed the buffer so a spill file really does hold the whole stream.
-        output_buffer = self._new_output_buffer()
+        output_buffer = self._new_output_buffer(command_id)
         output_buffer.add_chunk(cmd.stdout)
 
         last_log_time = 0.0
@@ -1600,7 +1605,9 @@ class CommandExecutor:
             cancel_event=cancel_event,
             output_buffer=output_buffer,
         )
-        return self._sm._scrub_sentinel_noise(stdout), stderr, exit_code
+        sent = command if command.strip().startswith("sudo") else f"sudo {command}"
+        cleaned = self._sm._scrub_sentinel_noise(stdout)
+        return self._sm._strip_command_echo(cleaned, sent), stderr, exit_code
 
     def _run_sudo_command(
         self,
@@ -1824,11 +1831,21 @@ class CommandExecutor:
                 sentinel = marker
                 logger.debug(f"Using sentinel marker: {sentinel}")
 
+            # The PTY echoes the command line only; the sentinel line is separate.
+            echo_target = (
+                command_to_send.split("\n", 1)[0] if sentinel else command_to_send
+            )
+
             def _finalize_stdout(text: str) -> str:
-                """Strip the PTY echo and trailing sentinel."""
-                return self._sm._strip_command_echo(
-                    self._sm._strip_sentinel(text, sentinel), command_to_send
-                ).strip()
+                """Summarise a truncated stream, then strip the PTY plumbing."""
+                if output_buffer is not None:
+                    text = output_buffer.render(text)
+                stripped = self._sm._strip_sentinel(text, sentinel)
+                stripped = self._sm._strip_command_echo(stripped, echo_target)
+                complete, without_prompt = self._sm._check_prompt_completion(
+                    session_key, stripped, stripped
+                )
+                return (without_prompt if complete else stripped).strip()
 
             logger.info(f"Executing command on {session_key}: {command}")
             shell.send((command_to_send + "\n").encode("utf-8"))
@@ -2072,14 +2089,15 @@ class CommandExecutor:
                         match = sentinel_pattern.search(clean_output)
                         if match:
                             exit_code = int(match.group(1))
-
-                            # Cut at the match, not at the echoed sentinel string.
-
-                            # Indices come from clean_output, so truncate that one.
+                            # Everything before the marker line is command output.
                             final_output = clean_output[: match.start()]
-
-                            # We should return the clean output directly
-                            return final_output.strip(), "", exit_code, None, sentinel
+                            return (
+                                _finalize_stdout(final_output),
+                                "",
+                                exit_code,
+                                None,
+                                sentinel,
+                            )
 
                     # Prompt matching only after a brief idle and once the echo has ended.
                     if seen_command_echo and (time.time() - last_recv_time) > 0.2:
@@ -2119,8 +2137,9 @@ class CommandExecutor:
                     else:
                         consecutive_misses += 1
 
-                        # If we've had too many consecutive misses, try recapturing the prompt
-                        if consecutive_misses > 10:
+                        # Marker sessions never complete on a prompt, so recapturing here
+                        # would send Ctrl+C into a running command for nothing.
+                        if not (sentinel or osc633) and consecutive_misses > 10:
                             miss_count = self._sm.registry.prompt_miss_count.get(session_key, 0) + 1
                             self._sm.registry.prompt_miss_count[session_key] = miss_count
 

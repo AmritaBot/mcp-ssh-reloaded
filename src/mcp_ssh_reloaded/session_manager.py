@@ -534,7 +534,8 @@ class SSHSessionManager:
     ) -> bool:
         """Install OSC 633 markers, leaving the session on sentinels when unsupported."""
         logger = self.logger.getChild("osc633")
-        nonce = new_nonce()
+        # Rotating would strand the markers an in-flight command is still waiting for.
+        nonce = self.registry.osc633.get(session_key) or new_nonce()
         path = self._upload_script_via_sftp(
             session_key, client, build_install_script(nonce)
         )

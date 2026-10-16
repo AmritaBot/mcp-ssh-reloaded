@@ -7,7 +7,9 @@ refactored without changing this public API.
 Zero dependency on fastmcp / MCP protocol.
 """
 
+import importlib.metadata
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -23,6 +25,23 @@ from .api_types import (
 )
 from .datastructures import SessionDiagnostics
 from .session_manager import SSHSessionManager
+
+_PACKAGE_NAME = "mcp-ssh-reloaded"
+
+_IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+
+def _package_version() -> str:
+    """Installed version, or ``unknown`` when running from a bare source tree."""
+    try:
+        return importlib.metadata.version(_PACKAGE_NAME)
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def _redact_addresses(text: str) -> str:
+    """Drop anything address-shaped, which the probe contract forbids."""
+    return _IPV4.sub("[redacted]", text)
 
 
 class SSHService:
@@ -105,6 +124,25 @@ class SSHService:
         except Exception as e:
             raise _to_ssh_error(e)
 
+
+    async def probe(self, conn: ConnectionParams) -> str:
+        """Describe the target host and this tool, without any address in the output."""
+        facts = (
+            ("os", "uname -srm"),
+            ("distro", "sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null"),
+            ("user", "id -un"),
+            ("shell", "echo $SHELL"),
+            ("sudo", "command -v sudo"),
+        )
+        lines = [f"tool={_PACKAGE_NAME}", f"tool_version={_package_version()}"]
+        for label, command in facts:
+            try:
+                result = await self.execute(conn, command)
+                values = (result.stdout or "").strip().splitlines()
+                lines.append(f"{label}={values[-1].strip() if values else 'unknown'}")
+            except Exception as exc:  # noqa: PERF203
+                lines.append(f"{label}=unavailable ({exc.__class__.__name__})")
+        return _redact_addresses("\n".join(lines))
 
     async def execute_async(
         self,
