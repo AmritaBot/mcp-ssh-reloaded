@@ -86,6 +86,29 @@ class ConnectionManager:
     ) -> str | None:
         return os.getenv(f"OVRD_{host}_{param}", default)
 
+    @staticmethod
+    def _host_of(session_key: str) -> str:
+        """Recover the host from a session key, keeping IPv6 colons intact."""
+        _, _, rest = session_key.partition("@")
+        return rest.rsplit(":", 1)[0]
+
+    def _reject_second_host(self, resolved_host: str, session_key: str) -> None:
+        """Refuse a second host. The registry lock must be held by the caller."""
+        other = next(
+            (
+                key
+                for key in self.registry.sessions
+                if key != session_key and self._host_of(key) != resolved_host
+            ),
+            None,
+        )
+        if other is not None:
+            raise ConnectionError(
+                f"single_session is on and {other} is already connected.\n"
+                "Close it first (close_session / close_all_sessions), or set "
+                "MCP_SSH_SINGLE_SESSION=false to work with several hosts at once."
+            )
+
     # -- session create/close/list --
 
     async def get_or_create_session(
@@ -108,6 +131,9 @@ class ConnectionManager:
             password = env_pass
 
         with self.registry.lock:
+            if self._sm.config.single_session:
+                self._reject_second_host(resolved_host, session_key)
+
             if session_key in self.registry.sessions:
                 client = self.registry.sessions[session_key]
                 try:

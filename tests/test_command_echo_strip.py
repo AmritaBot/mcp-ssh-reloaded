@@ -10,7 +10,10 @@ def _sm() -> SSHSessionManager:
 def test_strips_single_line_echo():
     sm = _sm()
     out = "ls -la /tmp\ntotal 8\n-rw-r--r-- 1 root root 0 a\n"
-    assert sm._strip_command_echo(out, "ls -la /tmp") == "total 8\n-rw-r--r-- 1 root root 0 a"
+    assert (
+        sm._strip_command_echo(out, "ls -la /tmp")
+        == "total 8\n-rw-r--r-- 1 root root 0 a"
+    )
 
 
 def test_strips_echo_with_readline_redraw_doubling():

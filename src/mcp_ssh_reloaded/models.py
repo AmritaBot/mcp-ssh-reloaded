@@ -270,6 +270,8 @@ class ServerConfig(BaseSettings):
     normal_idle_timeout: int = 2
     package_manager_idle_timeout: int = 10
     async_default_timeout: int = 30
+    # Opt-in: refuse a second host instead of evicting the first.
+    single_session: bool = False
 
 
 # Error types

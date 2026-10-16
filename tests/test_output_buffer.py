@@ -34,9 +34,7 @@ def test_large_output_keeps_head_and_tail():
 
 
 def test_spill_file_holds_the_full_stream():
-    buf = OutputBuffer(
-        max_size=10_000, head_size=5, tail_size=5, spill_threshold=20
-    )
+    buf = OutputBuffer(max_size=10_000, head_size=5, tail_size=5, spill_threshold=20)
     text = ""
     for i in range(20):
         piece, _ = buf.add_chunk(f"chunk-{i};")

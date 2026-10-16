@@ -200,6 +200,7 @@ Host myserver
 | `MCP_SSH_NORMAL_IDLE_TIMEOUT`            | `2`                         | 普通命令空闲超时       |
 | `MCP_SSH_PACKAGE_MANAGER_IDLE_TIMEOUT`   | `10`                        | 包管理器空闲超时       |
 | `MCP_SSH_ASYNC_DEFAULT_TIMEOUT`          | `30`                        | 异步命令默认超时       |
+| `MCP_SSH_SINGLE_SESSION`                 | `false`                     | 可选：同一时刻只允许一个 host |
 
 ### CLI 方式（serve 模式）
 

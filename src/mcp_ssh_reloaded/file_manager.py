@@ -583,8 +583,7 @@ class FileManager:
             return FileContent(
                 path=remote_path,
                 error=(
-                    "Sudo read output exceeded the command output cap; "
-                    "reduce max_bytes"
+                    "Sudo read output exceeded the command output cap; reduce max_bytes"
                 ),
             )
 

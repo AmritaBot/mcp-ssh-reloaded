@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import logging
+import os
 import re
 import threading
 import time
@@ -125,11 +126,18 @@ class CommandExecutor:
         r"\braspi-config\b",
     ]
 
-    def _new_output_buffer(self) -> OutputBuffer:
-        """Buffer honouring the configured output cap and spill directory."""
+    def _new_output_buffer(
+        self, command_id: str | None = None, *, append: bool = False
+    ) -> OutputBuffer:
+        """Buffer honouring the configured output cap, spilling under the log dir."""
+        spill_path = None
+        if command_id:
+            spill_path = os.path.join(self.config.log_dir, command_id, "content.txt")
         return OutputBuffer(
             max_size=self.config.max_output_bytes,
             spill_dir=self.config.log_dir,
+            spill_path=spill_path,
+            append=append,
         )
 
     def _mark_interpreter_exit(self):
@@ -476,7 +484,7 @@ class CommandExecutor:
         # Only one read loop may hold a session's shell at a time.
         exec_lock = self._sm.registry.execution_lock(session_key)
         exec_lock.acquire()
-        output_buffer = self._new_output_buffer()
+        output_buffer = self._new_output_buffer(command_id)
         try:
             with self._lock:
                 if command_id not in self._commands:
@@ -882,9 +890,10 @@ class CommandExecutor:
         last_recv_time = time.time()
         start_time = time.time()
 
-        # Seed the buffer so a spill file really does hold the whole stream.
-        output_buffer = self._new_output_buffer()
-        output_buffer.add_chunk(cmd.stdout)
+        # Resume the command's spill file; the inline value is a summary, not the stream.
+        output_buffer = self._new_output_buffer(command_id, append=True)
+        if not cmd.spilled_path:
+            output_buffer.add_chunk(cmd.stdout)
 
         last_log_time = 0.0
         poll_count = 0
@@ -1013,11 +1022,8 @@ class CommandExecutor:
                                 reported = self._osc633_exit(cmd)
 
                                 if reported is not None:
-
                                     with self._lock:
-
                                         if command_id in self._commands:
-
                                             cmd.status = CommandStatus.COMPLETED
 
                                             cmd.exit_code = reported
@@ -1088,11 +1094,8 @@ class CommandExecutor:
                             reported = self._osc633_exit(cmd)
 
                             if reported is not None:
-
                                 with self._lock:
-
                                     if command_id in self._commands:
-
                                         cmd.status = CommandStatus.COMPLETED
 
                                         cmd.exit_code = reported
@@ -1196,9 +1199,10 @@ class CommandExecutor:
         last_recv_time = time.time()
         start_time = time.time()
 
-        # Seed the buffer so a spill file really does hold the whole stream.
-        output_buffer = self._new_output_buffer()
-        output_buffer.add_chunk(cmd.stdout)
+        # Resume the command's spill file; the inline value is a summary, not the stream.
+        output_buffer = self._new_output_buffer(command_id, append=True)
+        if not cmd.spilled_path:
+            output_buffer.add_chunk(cmd.stdout)
 
         last_log_time = 0.0
         poll_count = 0
@@ -1286,11 +1290,8 @@ class CommandExecutor:
                                 reported = self._osc633_exit(cmd)
 
                                 if reported is not None:
-
                                     with self._lock:
-
                                         if command_id in self._commands:
-
                                             cmd.status = CommandStatus.COMPLETED
 
                                             cmd.exit_code = reported
@@ -1375,11 +1376,8 @@ class CommandExecutor:
                             reported = self._osc633_exit(cmd)
 
                             if reported is not None:
-
                                 with self._lock:
-
                                     if command_id in self._commands:
-
                                         cmd.status = CommandStatus.COMPLETED
 
                                         cmd.exit_code = reported
@@ -1600,7 +1598,9 @@ class CommandExecutor:
             cancel_event=cancel_event,
             output_buffer=output_buffer,
         )
-        return self._sm._scrub_sentinel_noise(stdout), stderr, exit_code
+        sent = command if command.strip().startswith("sudo") else f"sudo {command}"
+        cleaned = self._sm._scrub_sentinel_noise(stdout)
+        return self._sm._strip_command_echo(cleaned, sent), stderr, exit_code
 
     def _run_sudo_command(
         self,
@@ -1722,7 +1722,9 @@ class CommandExecutor:
                             break
 
                         # Check for interactive prompts during idle
-                        awaiting = self._sm._detect_awaiting_input(raw_output, session_key)
+                        awaiting = self._sm._detect_awaiting_input(
+                            raw_output, session_key
+                        )
                         if awaiting:
                             logger.info(
                                 f"Sudo command waiting for input (idle): {awaiting}"
@@ -1751,7 +1753,6 @@ class CommandExecutor:
         except Exception as exc:
             logger.logger.error(f"Error executing sudo command: {exc}", exc_info=True)
             return "", f"Error executing sudo command: {exc}", 1
-
 
     def _execute_standard_command_internal(
         self,
@@ -1797,7 +1798,9 @@ class CommandExecutor:
             shell_type = self._sm.registry.shell_types.get(session_key, "unknown")
             logger.debug(f"Shell type for {session_key}: {shell_type}")
             is_unix = shell_type == "unix_shell"
-            osc633 = is_unix and self._sm.is_osc633(session_key) and not context_changing
+            osc633 = (
+                is_unix and self._sm.is_osc633(session_key) and not context_changing
+            )
             nonce = self._sm.osc633_nonce(session_key) if osc633 else ""
 
             # Use sentinel only for Unix-like shells and non-interactive commands
@@ -1824,11 +1827,21 @@ class CommandExecutor:
                 sentinel = marker
                 logger.debug(f"Using sentinel marker: {sentinel}")
 
+            # The PTY echoes the command line only; the sentinel line is separate.
+            echo_target = (
+                command_to_send.split("\n", 1)[0] if sentinel else command_to_send
+            )
+
             def _finalize_stdout(text: str) -> str:
-                """Strip the PTY echo and trailing sentinel."""
-                return self._sm._strip_command_echo(
-                    self._sm._strip_sentinel(text, sentinel), command_to_send
-                ).strip()
+                """Summarise a truncated stream, then strip the PTY plumbing."""
+                if output_buffer is not None:
+                    text = output_buffer.render(text)
+                stripped = self._sm._strip_sentinel(text, sentinel)
+                stripped = self._sm._strip_command_echo(stripped, echo_target)
+                complete, without_prompt = self._sm._check_prompt_completion(
+                    session_key, stripped, stripped
+                )
+                return (without_prompt if complete else stripped).strip()
 
             logger.info(f"Executing command on {session_key}: {command}")
             shell.send((command_to_send + "\n").encode("utf-8"))
@@ -1965,7 +1978,9 @@ class CommandExecutor:
 
                     if should_check:
                         # Check for interactive prompts BEFORE checking for completion
-                        awaiting = self._sm._detect_awaiting_input(raw_output, session_key)
+                        awaiting = self._sm._detect_awaiting_input(
+                            raw_output, session_key
+                        )
                         if awaiting:
                             # Awaiting input needs a brief idle, except for pagers.
                             if (
@@ -2013,7 +2028,9 @@ class CommandExecutor:
                                                 logger.debug(
                                                     f"Received chunk (pager): {chunk!r}"
                                                 )
-                                                self._sm._feed_emulator(session_key, chunk)
+                                                self._sm._feed_emulator(
+                                                    session_key, chunk
+                                                )
                                                 limited_chunk, should_continue = (
                                                     output_buffer.add_chunk(chunk)
                                                 )
@@ -2021,7 +2038,9 @@ class CommandExecutor:
                                                 raw_output = "".join(raw_output_chunks)
                                                 if not should_continue:
                                                     return (
-                                                        output_buffer.render(raw_output),
+                                                        output_buffer.render(
+                                                            raw_output
+                                                        ),
                                                         output_buffer.limit_message,
                                                         1,
                                                         None,
@@ -2072,14 +2091,15 @@ class CommandExecutor:
                         match = sentinel_pattern.search(clean_output)
                         if match:
                             exit_code = int(match.group(1))
-
-                            # Cut at the match, not at the echoed sentinel string.
-
-                            # Indices come from clean_output, so truncate that one.
+                            # Everything before the marker line is command output.
                             final_output = clean_output[: match.start()]
-
-                            # We should return the clean output directly
-                            return final_output.strip(), "", exit_code, None, sentinel
+                            return (
+                                _finalize_stdout(final_output),
+                                "",
+                                exit_code,
+                                None,
+                                sentinel,
+                            )
 
                     # Prompt matching only after a brief idle and once the echo has ended.
                     if seen_command_echo and (time.time() - last_recv_time) > 0.2:
@@ -2119,10 +2139,16 @@ class CommandExecutor:
                     else:
                         consecutive_misses += 1
 
-                        # If we've had too many consecutive misses, try recapturing the prompt
-                        if consecutive_misses > 10:
-                            miss_count = self._sm.registry.prompt_miss_count.get(session_key, 0) + 1
-                            self._sm.registry.prompt_miss_count[session_key] = miss_count
+                        # Marker sessions never complete on a prompt, so recapturing here
+                        # would send Ctrl+C into a running command for nothing.
+                        if not (sentinel or osc633) and consecutive_misses > 10:
+                            miss_count = (
+                                self._sm.registry.prompt_miss_count.get(session_key, 0)
+                                + 1
+                            )
+                            self._sm.registry.prompt_miss_count[session_key] = (
+                                miss_count
+                            )
 
                             if miss_count > 3:
                                 logger.warning(
@@ -2130,7 +2156,9 @@ class CommandExecutor:
                                 )
                                 with self._sm.registry.lock:
                                     self._sm.registry.prompts.pop(session_key, None)
-                                    self._sm.registry.prompt_patterns.pop(session_key, None)
+                                    self._sm.registry.prompt_patterns.pop(
+                                        session_key, None
+                                    )
 
                                 # Try to clear any stuck state with Ctrl+C
                                 logger.info(
@@ -2181,7 +2209,9 @@ class CommandExecutor:
                         clean_output = self._sm._strip_ansi(raw_output)
 
                         # Check for interactive prompts BEFORE checking for completion
-                        awaiting = self._sm._detect_awaiting_input(raw_output, session_key)
+                        awaiting = self._sm._detect_awaiting_input(
+                            raw_output, session_key
+                        )
                         if awaiting:
                             logger.info(
                                 f"Detected interactive prompt during idle timeout: {awaiting}"
@@ -2321,7 +2351,6 @@ class CommandExecutor:
             with self._sm.registry.lock:
                 self._sm.registry.active_commands.pop(session_key, None)
 
-
     async def _execute_enable_mode_command_internal(
         self,
         client: paramiko.SSHClient,
@@ -2441,5 +2470,3 @@ class CommandExecutor:
         except Exception as exc:
             logger.logger.error(f"Enable mode command error: {exc}", exc_info=True)
             return "", f"Error executing enable mode command: {exc}", 1
-
-

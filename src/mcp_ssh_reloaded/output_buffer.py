@@ -11,7 +11,8 @@ barely change, but adds:
   only the beginning, so the interesting part (the last error, the prompt) is
   still visible;
 * spill-to-disk - once the stream outgrows ``spill_threshold`` the full output
-  is written to a temporary file and its path is reported back;
+  is written to ``spill_path`` (a temporary file when the caller passes none)
+  and its path is reported back;
 * an explicit ``truncated`` flag, so callers stop overloading exit codes.
 """
 
@@ -23,7 +24,11 @@ import tempfile
 DEFAULT_MAX_BYTES = 10 * 1024 * 1024
 DEFAULT_HEAD_BYTES = 8 * 1024
 DEFAULT_TAIL_BYTES = 32 * 1024
-DEFAULT_SPILL_THRESHOLD = 64 * 1024
+# Spill as soon as the stream outgrows the inline window.
+DEFAULT_SPILL_THRESHOLD = DEFAULT_HEAD_BYTES + DEFAULT_TAIL_BYTES
+# A spilled stream is summarised; the caller reads the file instead.
+SPILL_HEAD_BYTES = 2 * 1024
+SPILL_TAIL_BYTES = 2 * 1024
 
 
 class OutputBuffer:
@@ -37,6 +42,8 @@ class OutputBuffer:
         tail_size: int = DEFAULT_TAIL_BYTES,
         spill_threshold: int = DEFAULT_SPILL_THRESHOLD,
         spill_dir: str | None = None,
+        spill_path: str | None = None,
+        append: bool = False,
     ):
         self.max_size = max_size
         # The head/tail window can never be wider than the cap itself.
@@ -45,6 +52,8 @@ class OutputBuffer:
         # Spill well before the cap, even for very small caps.
         self.spill_threshold = min(spill_threshold, max(1, max_size // 2))
         self.spill_dir = spill_dir
+        self.spill_path = spill_path
+        self.append = append
 
         self.current_size = 0
         self.truncated = False
@@ -89,12 +98,26 @@ class OutputBuffer:
 
     def _open_spill(self) -> None:
         """Create the spill file and flush everything collected so far."""
+        path = self.spill_path
         try:
-            fd, path = tempfile.mkstemp(
-                prefix="mcp_ssh_output_", suffix=".log", dir=self.spill_dir
-            )
-            with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as handle:
-                handle.write("".join(self._pending))
+            if path:
+                parent = os.path.dirname(path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True, mode=0o700)
+                flags = os.O_WRONLY | os.O_CREAT
+                flags |= os.O_APPEND if self.append else os.O_TRUNC
+                descriptor = os.open(path, flags, 0o600)
+                mode = "a" if self.append else "w"
+                with os.fdopen(
+                    descriptor, mode, encoding="utf-8", errors="replace"
+                ) as handle:
+                    handle.write("".join(self._pending))
+            else:
+                fd, path = tempfile.mkstemp(
+                    prefix="mcp_ssh_output_", suffix=".log", dir=self.spill_dir
+                )
+                with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as handle:
+                    handle.write("".join(self._pending))
             self.spilled_path = path
             self._pending.clear()
         except OSError:
@@ -123,14 +146,20 @@ class OutputBuffer:
         if not self.truncated:
             return text
 
+        head_size = self.head_size
+        tail_size = self.tail_size
+        if self.spilled_path:
+            head_size = min(head_size, SPILL_HEAD_BYTES)
+            tail_size = min(tail_size, SPILL_TAIL_BYTES)
+
         encoded = text.encode("utf-8")
-        head = encoded[: self.head_size].decode("utf-8", "ignore")
+        head = encoded[:head_size].decode("utf-8", "ignore")
         tail = (
-            encoded[-self.tail_size :].decode("utf-8", "ignore")
-            if len(encoded) > self.tail_size
+            encoded[-tail_size:].decode("utf-8", "ignore")
+            if len(encoded) > tail_size
             else ""
         )
-        omitted = max(0, len(encoded) - self.head_size - self.tail_size)
+        omitted = max(0, len(encoded) - head_size - tail_size)
         rendered = f"{head}\n\n... [{omitted} bytes omitted] ...\n\n{tail}"
         if self.spilled_path:
             rendered += f"\n\n[full output saved to {self.spilled_path}]"
