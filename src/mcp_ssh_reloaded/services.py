@@ -30,6 +30,14 @@ _PACKAGE_NAME = "mcp-ssh-reloaded"
 
 _IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 
+_IPV6 = re.compile(
+    r"(?<![0-9A-Fa-f:.])"
+    r"(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){3,7}"
+    r"|(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?"
+    r"::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?)"
+    r"(?![0-9A-Fa-f:])"
+)
+
 
 def _package_version() -> str:
     """Installed version, or ``unknown`` when running from a bare source tree."""
@@ -41,7 +49,7 @@ def _package_version() -> str:
 
 def _redact_addresses(text: str) -> str:
     """Drop anything address-shaped, which the probe contract forbids."""
-    return _IPV4.sub("[redacted]", text)
+    return _IPV6.sub("[redacted]", _IPV4.sub("[redacted]", text))
 
 
 class SSHService:
@@ -65,7 +73,6 @@ class SSHService:
         self.config: ServerConfig = config or ServerConfig()
         self.logger: logging.Logger = logger or logging.getLogger("ssh_service")
         self._engine = SSHSessionManager(config=self.config)
-
 
     async def execute(
         self,
@@ -123,7 +130,6 @@ class SSHService:
             raise _to_ssh_error(e)
         except Exception as e:
             raise _to_ssh_error(e)
-
 
     async def probe(self, conn: ConnectionParams) -> str:
         """Describe the target host and this tool, without any address in the output."""
@@ -184,7 +190,6 @@ class SSHService:
     def list_history(self, limit: int = 50) -> list[dict[str, Any]]:
         """List completed/failed/interrupted commands."""
         return self._engine.list_command_history(limit)
-
 
     async def read_file(
         self,
@@ -264,7 +269,6 @@ class SSHService:
             )
         return msg
 
-
     async def list_sessions(self) -> list[SessionInfo]:
         """List active SSH sessions."""
         raw = await self._engine.list_sessions()
@@ -300,7 +304,6 @@ class SSHService:
         """Close all sessions."""
         await self._engine.close_all_sessions()
 
-
     async def get_diagnostics(self, conn: ConnectionParams) -> SessionDiagnostics:
         """Get session diagnostic info."""
         return self._engine.get_session_diagnostics(conn.host, conn.username, conn.port)
@@ -316,7 +319,6 @@ class SSHService:
     async def get_perf_metrics(self) -> dict[str, Any]:
         """Get performance metrics."""
         return self._engine.get_performance_metrics()
-
 
     @property
     def engine(self) -> SSHSessionManager:

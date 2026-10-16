@@ -99,7 +99,12 @@ def test_install_script_preserves_command_status(tmp_path: Path) -> None:
 def test_install_script_wires_scalar_prompt_command(tmp_path: Path) -> None:
     script = _stage(tmp_path)
     result = subprocess.run(
-        ["bash", "--norc", "-c", f'PROMPT_COMMAND="echo old"; . {script}; printf "%s" "$PROMPT_COMMAND"'],
+        [
+            "bash",
+            "--norc",
+            "-c",
+            f'PROMPT_COMMAND="echo old"; . {script}; printf "%s" "$PROMPT_COMMAND"',
+        ],
         capture_output=True,
         text=True,
         check=False,
@@ -126,7 +131,12 @@ def test_install_script_keeps_array_prompt_command(tmp_path: Path) -> None:
 def test_install_script_is_idempotent(tmp_path: Path) -> None:
     script = _stage(tmp_path)
     result = subprocess.run(
-        ["bash", "--norc", "-c", f". {script}; . {script}; printf '%s' \"$PROMPT_COMMAND\""],
+        [
+            "bash",
+            "--norc",
+            "-c",
+            f". {script}; . {script}; printf '%s' \"$PROMPT_COMMAND\"",
+        ],
         capture_output=True,
         text=True,
         check=False,

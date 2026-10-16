@@ -78,7 +78,9 @@ class SessionDiagnosticsProvider:
             if prompt_pattern:
                 diagnostics.prompt_pattern = prompt_pattern.pattern
                 # Calculate confidence based on recent prompt detection success
-                miss_count = self.session_manager.registry.prompt_miss_count.get(session_key, 0)
+                miss_count = self.session_manager.registry.prompt_miss_count.get(
+                    session_key, 0
+                )
                 diagnostics.prompt_detection_confidence = max(
                     0.0, 100.0 - (miss_count * 10.0)
                 )
@@ -136,8 +138,8 @@ class SessionDiagnosticsProvider:
             state["prompt_pattern_available"] = (
                 session_key in self.session_manager.registry.prompt_patterns
             )
-            state["prompt_miss_count"] = self.session_manager.registry.prompt_miss_count.get(
-                session_key, 0
+            state["prompt_miss_count"] = (
+                self.session_manager.registry.prompt_miss_count.get(session_key, 0)
             )
 
         except Exception as e:
@@ -225,7 +227,9 @@ class SessionDiagnosticsProvider:
                 shell_type = self.session_manager.registry.shell_types.get(
                     session_key, "unknown"
                 )
-                last_cmd = self.session_manager.registry.active_commands.get(session_key)
+                last_cmd = self.session_manager.registry.active_commands.get(
+                    session_key
+                )
 
                 report["session_details"][session_key] = {
                     "health": health,
@@ -252,7 +256,9 @@ class SessionDiagnosticsProvider:
 
         try:
             # Check prompt detection confidence
-            miss_count = self.session_manager.registry.prompt_miss_count.get(session_key, 0)
+            miss_count = self.session_manager.registry.prompt_miss_count.get(
+                session_key, 0
+            )
             if miss_count > 3:
                 suggestions.append(
                     "Consider resetting prompt detection - multiple misses detected"

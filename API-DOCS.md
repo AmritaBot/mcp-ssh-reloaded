@@ -386,8 +386,9 @@ comes back as `[redacted]`.
 ### Long output
 
 A stream that outgrows the inline window (40 KB) is not echoed back. The result carries
-a head+tail summary plus a `spilled_path`, and the whole stream is on disk at
-`<log_dir>/<command_id>/content.txt` on the host running this server. Read it back with
+a head+tail summary plus a `spilled_path`, and the captured stream is on disk at
+`<log_dir>/<command_id>/content.txt` on the host running this server. The file holds
+everything up to `max_output_bytes`; the cap is a safety valve and is not exceeded. Read it back with
 `read_file` when that host is reachable, or from its filesystem directly.
 
 ### `get_health_report` / `get_perf_metrics`

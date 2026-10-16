@@ -85,7 +85,8 @@ def test_long_output_completes_and_spills():
     try:
         with open(result.spilled_path, encoding="utf-8") as handle:
             body = handle.read()
-        assert "9999" in body and "10000" in body
+        assert "9999" in body
+        assert "10000" in body
         assert len(result.stdout.encode()) < 8000, "long output must not be echoed"
         assert f"[full output saved to {result.spilled_path}]" in result.stdout
     finally:

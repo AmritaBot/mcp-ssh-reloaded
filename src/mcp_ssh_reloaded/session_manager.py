@@ -99,7 +99,6 @@ class SSHSessionManager:
         self.command_executor = CommandExecutor(self, config=self.config)
         self.file_manager = FileManager(self)
 
-
     @property
     def command_validator(self):
         """The shared command validator."""
@@ -114,7 +113,6 @@ class SSHSessionManager:
     def pty_aware_validation(self) -> bool:
         """Whether validation is relaxed for PTY inspection commands."""
         return self._pty_aware_validation
-
 
     def _load_ssh_config(self):
         return ConnectionManager.load_ssh_config()
@@ -159,7 +157,6 @@ class SSHSessionManager:
     async def list_sessions(self) -> list[str]:
         return await self.connection.list_sessions()
 
-
     async def _enter_enable_mode(
         self,
         session_key,
@@ -175,7 +172,6 @@ class SSHSessionManager:
             enable_command,
             timeout or self.ENABLE_MODE_TIMEOUT,
         )
-
 
     def _feed_emulator(self, session_key: str, data: str) -> None:
         """Feed data to terminal emulator if interactive mode is enabled."""
@@ -297,7 +293,6 @@ class SSHSessionManager:
             "width": screen.columns,
             "height": screen.lines,
         }
-
 
     def _get_or_create_shell(
         self, session_key: str, client: paramiko.SSHClient
@@ -1110,7 +1105,6 @@ class SSHSessionManager:
         """Strip the sentinel command and marker from output if present."""
         if not sentinel or sentinel not in output:
             return output
-
 
         # The sentinel block starts at the __mcp_status assignment.
         sentinel_start = output.find("__mcp_status=$?")

@@ -43,6 +43,7 @@ class OutputBuffer:
         spill_threshold: int = DEFAULT_SPILL_THRESHOLD,
         spill_dir: str | None = None,
         spill_path: str | None = None,
+        append: bool = False,
     ):
         self.max_size = max_size
         # The head/tail window can never be wider than the cap itself.
@@ -52,6 +53,7 @@ class OutputBuffer:
         self.spill_threshold = min(spill_threshold, max(1, max_size // 2))
         self.spill_dir = spill_dir
         self.spill_path = spill_path
+        self.append = append
 
         self.current_size = 0
         self.truncated = False
@@ -101,8 +103,14 @@ class OutputBuffer:
             if path:
                 parent = os.path.dirname(path)
                 if parent:
-                    os.makedirs(parent, exist_ok=True)
-                with open(path, "w", encoding="utf-8", errors="replace") as handle:
+                    os.makedirs(parent, exist_ok=True, mode=0o700)
+                flags = os.O_WRONLY | os.O_CREAT
+                flags |= os.O_APPEND if self.append else os.O_TRUNC
+                descriptor = os.open(path, flags, 0o600)
+                mode = "a" if self.append else "w"
+                with os.fdopen(
+                    descriptor, mode, encoding="utf-8", errors="replace"
+                ) as handle:
                     handle.write("".join(self._pending))
             else:
                 fd, path = tempfile.mkstemp(

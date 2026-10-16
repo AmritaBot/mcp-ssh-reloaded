@@ -93,16 +93,15 @@ class ConnectionManager:
         return rest.rsplit(":", 1)[0]
 
     def _reject_second_host(self, resolved_host: str, session_key: str) -> None:
-        """Refuse a second host while another one holds the only session slot."""
-        with self.registry.lock:
-            other = next(
-                (
-                    key
-                    for key in self.registry.sessions
-                    if key != session_key and self._host_of(key) != resolved_host
-                ),
-                None,
-            )
+        """Refuse a second host. The registry lock must be held by the caller."""
+        other = next(
+            (
+                key
+                for key in self.registry.sessions
+                if key != session_key and self._host_of(key) != resolved_host
+            ),
+            None,
+        )
         if other is not None:
             raise ConnectionError(
                 f"single_session is on and {other} is already connected.\n"
@@ -131,10 +130,10 @@ class ConnectionManager:
         if env_pass := self.get_env_override(host, "PASS"):
             password = env_pass
 
-        if self._sm.config.single_session:
-            self._reject_second_host(resolved_host, session_key)
-
         with self.registry.lock:
+            if self._sm.config.single_session:
+                self._reject_second_host(resolved_host, session_key)
+
             if session_key in self.registry.sessions:
                 client = self.registry.sessions[session_key]
                 try:
