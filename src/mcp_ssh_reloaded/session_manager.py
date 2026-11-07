@@ -26,7 +26,7 @@ from .enable import EnableMode
 from .enhanced_executor import EnhancedCommandExecutor
 from .file_manager import FileManager
 from .logging_manager import get_context_logger, get_logger
-from .models import FileContent
+from .models import BinaryFileContent, FileContent
 from .session_diagnostics import ConnectionProfileManager, SessionDiagnosticsProvider
 from .session_registry import SessionRegistry
 from .shell_integration import build_install_script, has_marker, new_nonce
@@ -1492,6 +1492,29 @@ class SSHSessionManager:
             timeout=timeout,
             start_line=start_line,
             offset=offset,
+        )
+
+    async def read_binary(
+        self,
+        host: str,
+        remote_path: str,
+        username: str | None = None,
+        password: str | None = None,
+        key_filename: str | None = None,
+        port: int | None = None,
+        max_bytes: int = 4 * 1024 * 1024,
+        timeout: int = 30,
+    ) -> BinaryFileContent:
+        """Delegate raw remote file reads to the FileManager helper."""
+        return await self.file_manager.read_binary(
+            host=host,
+            remote_path=remote_path,
+            username=username,
+            password=password,
+            key_filename=key_filename,
+            port=port,
+            max_bytes=max_bytes,
+            timeout=timeout,
         )
 
     async def write_file(

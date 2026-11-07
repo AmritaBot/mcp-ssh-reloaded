@@ -139,6 +139,27 @@ class FileContent:
     error: str | None = None
 
 
+@dataclass
+class BinaryFileContent:
+    """Raw bytes read from a remote file, capped at a byte limit."""
+
+    path: str = ""
+    data: bytes = b""
+    size: int = 0
+    error: str | None = None
+
+
+@dataclass
+class ImagePayload:
+    """A validated remote image ready to be returned as MCP image content."""
+
+    path: str = ""
+    data: bytes = b""
+    mime_type: str = ""
+    width: int = 0
+    height: int = 0
+
+
 # Session lifecycle
 
 
@@ -272,6 +293,10 @@ class ServerConfig(BaseSettings):
     async_default_timeout: int = 30
     # Opt-in: refuse a second host instead of evicting the first.
     single_session: bool = False
+    # Experimental: expose read_image and return images as MCP content blocks.
+    enable_image_reading: bool = False
+    max_image_bytes: int = 4 * 1024 * 1024
+    max_image_pixels: int = 16_000_000
 
 
 # Error types

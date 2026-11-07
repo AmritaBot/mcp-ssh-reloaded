@@ -9,6 +9,7 @@ import asyncio
 import json
 
 from fastmcp import FastMCP
+from fastmcp.utilities.types import Image
 
 from .api_types import ConnectionParams, ServerConfig
 from .error_handler import ErrorHandler
@@ -19,6 +20,7 @@ mcp = FastMCP("ssh-session")
 # Lazy init so tests that import server.py don't trigger engine construction.
 _svc: SSHService | None = None
 _config: ServerConfig | None = None
+_image_tool_registered = False
 
 
 def configure_server(config: ServerConfig | None = None) -> None:
@@ -27,8 +29,11 @@ def configure_server(config: ServerConfig | None = None) -> None:
     Call this *before* any tool invocations to override defaults.
     If *config* is None, ``ServerConfig()`` is used which reads ``MCP_SSH_*`` env vars.
     """
-    global _config
+    global _config, _image_tool_registered
     _config = config or ServerConfig()
+    if _config.enable_image_reading and not _image_tool_registered:
+        mcp.add_tool(read_image)
+        _image_tool_registered = True
 
 
 def _service() -> SSHService:
@@ -216,6 +221,34 @@ async def read_file(
                 result += f"; or offset={fc.next_offset}"
             result += "]"
         return result
+    except Exception as e:
+        return _fmt_error(e)
+
+
+async def read_image(
+    host: str,
+    remote_path: str,
+    username: str | None = None,
+    password: str | None = None,
+    key_filename: str | None = None,
+    port: int | None = None,
+    max_bytes: int | None = None,
+    timeout: int | None = None,
+) -> Image | str:
+    """Experimental: read a remote image and return it as MCP image content.
+
+    The payload must be a complete PNG, JPEG, GIF or WebP file. Magic bytes and
+    container structure are checked; anything else is rejected as an
+    unsupported image format.
+    """
+    try:
+        payload = await _service().read_image(
+            _conn(host, username, password, key_filename, port),
+            remote_path,
+            max_bytes=max_bytes,
+            timeout=timeout,
+        )
+        return Image(data=payload.data, format=payload.mime_type.rsplit("/", 1)[-1])
     except Exception as e:
         return _fmt_error(e)
 

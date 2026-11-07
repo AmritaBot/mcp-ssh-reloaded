@@ -6,6 +6,7 @@ This module only re-exports them so existing imports keep working.
 
 from .models import (
     AuthMethod,
+    BinaryFileContent,
     CommandResult,
     CommandStatus,
     ConnectionParams,
@@ -13,6 +14,7 @@ from .models import (
     ErrorCategory,
     ExecutionResult,
     FileContent,
+    ImagePayload,
     ServerConfig,
     SessionDiagnostics,
     SessionInfo,
@@ -21,6 +23,7 @@ from .models import (
 
 __all__ = [
     "AuthMethod",
+    "BinaryFileContent",
     "CommandResult",
     "CommandStatus",
     "ConnectionParams",
@@ -28,6 +31,7 @@ __all__ = [
     "ErrorCategory",
     "ExecutionResult",
     "FileContent",
+    "ImagePayload",
     "SSHError",
     "ServerConfig",
     "SessionDiagnostics",
