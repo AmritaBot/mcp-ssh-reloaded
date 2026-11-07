@@ -12,6 +12,7 @@
 - **网络设备** - 支持 Cisco、Juniper、MikroTik 等设备的 enable 模式
 - **Sudo 支持** - Unix/Linux 主机自动处理 sudo 密码
 - **文件操作** - 通过 SFTP 读写远程文件（无权限时回退到 sudo）
+- **读图（实验性）** - 将远程 PNG/JPEG/GIF/WebP 作为 MCP 图像内容返回
 - **命令中断** - 发送 Ctrl+C 停止运行中的命令
 - **线程安全** - 并发操作安全
 - **异步原生** - 原生asyncio优先
@@ -217,6 +218,24 @@ from mcp_ssh_reloaded import SSHService, ServerConfig
 
 svc = SSHService(config=ServerConfig(default_timeout=60, max_timeout=600))
 ```
+
+### 实验性：读图
+
+`read_image` 默认关闭，使用 `--enable-image-reading` 或
+`MCP_SSH_ENABLE_IMAGE_READING=true` 开启后会多出一个工具：
+
+```python
+read_image(host, remote_path, username=None, password=None, key_filename=None,
+           port=None, max_bytes=None, timeout=None)
+```
+
+文件经 SFTP 读取后作为 MCP 图像内容返回。只接受 PNG、JPEG、GIF 和 WebP，
+校验依据是魔数与容器结构：PNG 的签名、IHDR 校验和与 IEND；JPEG 的帧头与
+EOI；GIF 的结尾标记；WebP 的 RIFF 长度与 VP8/VP8L/VP8X 头。扩展名不参与
+判断，截断或无法解析的内容一律返回 `Unsupported image format`。
+
+`MCP_SSH_MAX_IMAGE_BYTES` 限制文件大小，`MCP_SSH_MAX_IMAGE_PIXELS` 限制
+解码后的像素总量（单边上限 8192 像素）。该工具需要客户端支持图像内容块。
 
 ## 工作原理
 

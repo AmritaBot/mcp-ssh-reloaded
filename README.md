@@ -12,6 +12,7 @@ An MCP (Model Context Protocol) server that enables AI agents to establish and m
 - **Network Devices** - enable mode handling for Cisco, Juniper, MikroTik, etc.
 - **Sudo Support** - automatic password handling for Unix/Linux hosts
 - **File Operations** - read/write remote files via SFTP (sudo fallback)
+- **Image Reading (experimental)** - return remote PNG/JPEG/GIF/WebP files as MCP image content
 - **Command Interruption** - send Ctrl+C to stop running commands
 - **Thread-safe** - safe for concurrent operations
 - **Async Native** - built-in support for asynio.
@@ -200,6 +201,9 @@ All tunables live in `ServerConfig`. Values resolve in priority:
 | `MCP_SSH_NORMAL_IDLE_TIMEOUT`            | `2`                         | Normal idle timeout (seconds)       |
 | `MCP_SSH_PACKAGE_MANAGER_IDLE_TIMEOUT`   | `10`                        | Package manager idle timeout        |
 | `MCP_SSH_ASYNC_DEFAULT_TIMEOUT`          | `30`                        | Async command default timeout       |
+| `MCP_SSH_ENABLE_IMAGE_READING`           | `false`                     | Enable the experimental `read_image` tool |
+| `MCP_SSH_MAX_IMAGE_BYTES`                | `4194304`                   | Max image file size (4 MB)          |
+| `MCP_SSH_MAX_IMAGE_PIXELS`               | `16000000`                  | Max image pixel count (16 MP)       |
 
 ### Via CLI (serve modes)
 
@@ -216,6 +220,27 @@ from mcp_ssh_reloaded import SSHService, ServerConfig
 
 svc = SSHService(config=ServerConfig(default_timeout=60, max_timeout=600))
 ```
+
+### Experimental: image reading
+
+`read_image` is off by default. Enable it with `--enable-image-reading` or
+`MCP_SSH_ENABLE_IMAGE_READING=true` to expose one more tool:
+
+```python
+read_image(host, remote_path, username=None, password=None, key_filename=None,
+           port=None, max_bytes=None, timeout=None)
+```
+
+The file is read over SFTP and returned as MCP image content. Only PNG, JPEG,
+GIF and WebP are accepted. Validation is based on magic bytes and container
+structure: signature, IHDR checksum and IEND for PNG; frame header and EOI for
+JPEG; trailer for GIF; RIFF length plus VP8/VP8L/VP8X headers for WebP. A file
+extension is never trusted, and truncated or unparsable payloads are rejected
+with `Unsupported image format`.
+
+`MCP_SSH_MAX_IMAGE_BYTES` caps the file size, and `MCP_SSH_MAX_IMAGE_PIXELS`
+caps the decoded dimensions (with a per-side cap of 8192 pixels). The tool is
+only useful with clients that accept image content blocks.
 
 ## How It Works
 

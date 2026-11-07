@@ -91,6 +91,17 @@ def _add_config_args(parser: argparse.ArgumentParser, prefix: str = "") -> None:
         help="Enable interactive/PTY mode (env: MCP_SSH_INTERACTIVE_MODE, default: on)",
     )
     group.add_argument(
+        "--enable-image-reading",
+        nargs="?",
+        const=True,
+        type=lambda v: v.lower() in ("1", "true", "yes", "on"),
+        default=None,
+        help=(
+            "Enable the experimental read_image tool "
+            "(env: MCP_SSH_ENABLE_IMAGE_READING, default: off)"
+        ),
+    )
+    group.add_argument(
         "--pty-aware-validation",
         type=lambda v: v.lower() in ("1", "true", "yes", "on"),
         default=None,

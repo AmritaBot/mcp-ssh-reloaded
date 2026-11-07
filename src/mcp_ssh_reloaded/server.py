@@ -9,9 +9,11 @@ import asyncio
 import json
 
 from fastmcp import FastMCP
+from fastmcp.utilities.types import Image
 
-from .api_types import ConnectionParams, ServerConfig
+from .api_types import ConnectionParams, ServerConfig, SSHError
 from .error_handler import ErrorHandler
+from .models import ErrorInfo
 from .services import SSHService
 
 mcp = FastMCP("ssh-session")
@@ -19,6 +21,7 @@ mcp = FastMCP("ssh-session")
 # Lazy init so tests that import server.py don't trigger engine construction.
 _svc: SSHService | None = None
 _config: ServerConfig | None = None
+_image_tool_registered = False
 
 
 def configure_server(config: ServerConfig | None = None) -> None:
@@ -27,8 +30,14 @@ def configure_server(config: ServerConfig | None = None) -> None:
     Call this *before* any tool invocations to override defaults.
     If *config* is None, ``ServerConfig()`` is used which reads ``MCP_SSH_*`` env vars.
     """
-    global _config
+    global _config, _image_tool_registered
     _config = config or ServerConfig()
+    if _config.enable_image_reading and not _image_tool_registered:
+        mcp.add_tool(read_image)
+        _image_tool_registered = True
+    elif not _config.enable_image_reading and _image_tool_registered:
+        mcp.local_provider.remove_tool("read_image")
+        _image_tool_registered = False
 
 
 def _service() -> SSHService:
@@ -216,6 +225,29 @@ async def read_file(
                 result += f"; or offset={fc.next_offset}"
             result += "]"
         return result
+    except Exception as e:
+        return _fmt_error(e)
+
+
+async def read_image(
+    host: str,
+    remote_path: str,
+    username: str | None = None,
+    password: str | None = None,
+    key_filename: str | None = None,
+    port: int | None = None,
+    max_bytes: int | None = None,
+    timeout: int | None = None,
+) -> Image | str:
+    """Experimental: read a remote PNG, JPEG, GIF or WebP as MCP image content."""
+    try:
+        payload = await _service().read_image(
+            _conn(host, username, password, key_filename, port),
+            remote_path,
+            max_bytes=max_bytes,
+            timeout=timeout,
+        )
+        return Image(data=payload.data, format=payload.mime_type.rsplit("/", 1)[-1])
     except Exception as e:
         return _fmt_error(e)
 
@@ -554,5 +586,15 @@ async def get_performance_metrics() -> str:
 
 def _fmt_error(exc: Exception) -> str:
     """Format an exception for MCP response."""
+    if isinstance(exc, SSHError):
+        einfo = ErrorInfo(
+            category=exc.category,
+            message=exc.message,
+            original_error=exc.detail or exc.message,
+            troubleshooting_hint=ErrorHandler.TROUBLESHOOTING_HINTS.get(exc.category),
+            suggest_action=ErrorHandler.SUGGESTED_ACTIONS.get(exc.category),
+        )
+        return ErrorHandler.format_error_for_ai(einfo)
+
     einfo = ErrorHandler.categorize_error(str(exc), exc)
     return ErrorHandler.format_error_for_ai(einfo)

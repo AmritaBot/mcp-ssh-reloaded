@@ -24,6 +24,8 @@ from .api_types import (
     SSHError,
 )
 from .datastructures import SessionDiagnostics
+from .image_validation import ImageValidationError, sniff_image
+from .models import ImagePayload
 from .session_manager import SSHSessionManager
 
 _PACKAGE_NAME = "mcp-ssh-reloaded"
@@ -227,6 +229,56 @@ class SSHService:
                 detail=fc.error,
             )
         return fc
+
+    async def read_image(
+        self,
+        conn: ConnectionParams,
+        path: str,
+        *,
+        max_bytes: int | None = None,
+        timeout: int | None = None,
+    ) -> ImagePayload:
+        """Read and validate a remote image before it reaches the client."""
+        byte_limit = self.config.max_image_bytes
+        if max_bytes is not None:
+            byte_limit = min(max_bytes, byte_limit)
+
+        content = await self._engine.read_binary(
+            host=conn.host,
+            remote_path=path,
+            username=conn.username,
+            password=conn.password,
+            key_filename=conn.key_filename,
+            port=conn.port,
+            max_bytes=byte_limit,
+            timeout=timeout or self.config.default_timeout,
+        )
+        if content.error:
+            raise SSHError(
+                category=ErrorCategory.PERMISSION,
+                message=f"Cannot read image {path}",
+                detail=content.error,
+            )
+
+        try:
+            info = sniff_image(
+                content.data,
+                max_pixels=self.config.max_image_pixels,
+            )
+        except ImageValidationError as e:
+            raise SSHError(
+                category=ErrorCategory.PROTOCOL,
+                message=f"Unsupported image format: {path}",
+                detail=str(e),
+            ) from e
+
+        return ImagePayload(
+            path=content.path,
+            data=content.data,
+            mime_type=info.mime_type,
+            width=info.width,
+            height=info.height,
+        )
 
     async def write_file(
         self,

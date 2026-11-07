@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 
 import paramiko
 
-from .models import FileContent
+from .models import BinaryFileContent, FileContent
 
 if TYPE_CHECKING:
     from mcp_ssh_reloaded.session_manager import SSHSessionManager
@@ -203,6 +203,101 @@ class FileManager:
 
         logger.error("Unexpected error in read_file logic.")
         return FileContent(path=remote_path, error="Unexpected error in read_file")
+
+    async def read_binary(
+        self,
+        host: str,
+        remote_path: str,
+        username: str | None = None,
+        password: str | None = None,
+        key_filename: str | None = None,
+        port: int | None = None,
+        max_bytes: int = 4 * 1024 * 1024,
+        timeout: int = 30,
+    ) -> BinaryFileContent:
+        """Read raw bytes from a remote file, refusing anything over max_bytes."""
+        logger = self.logger.getChild("read_binary")
+        logger.info(f"Reading binary file on {host}: {remote_path}")
+
+        if not remote_path:
+            return BinaryFileContent(error="Remote path must be provided")
+        if max_bytes <= 0:
+            return BinaryFileContent(
+                path=remote_path, error="max_bytes must be a positive integer"
+            )
+
+        _, _, _, _, session_key = self._session_manager._resolve_connection(
+            host, username, port
+        )
+        # TODO: cold-start sessions serialize on registry.lock; revisit separately.
+        client = await self._session_manager.get_or_create_session(
+            host, username, password, key_filename, port
+        )
+
+        # TODO: synchronous SFTP calls block the event loop; move them to a thread later.
+        sftp = None
+        try:
+            sftp = client.open_sftp()
+            channel = sftp.get_channel()
+            if timeout and channel is not None:
+                channel.settimeout(timeout)
+            resolved_path = self._resolve_sftp_path(sftp, remote_path)
+            attrs = sftp.stat(resolved_path)
+            if attrs.st_mode is not None and stat.S_ISDIR(attrs.st_mode):
+                logger.error(f"Remote path is a directory: {resolved_path}")
+                return BinaryFileContent(
+                    path=resolved_path,
+                    error=f"Remote path is a directory: {resolved_path}",
+                )
+            if attrs.st_size is not None and attrs.st_size > max_bytes:
+                return BinaryFileContent(
+                    path=resolved_path,
+                    size=attrs.st_size,
+                    error=(
+                        f"File is larger than the {max_bytes} byte limit: "
+                        f"{resolved_path}"
+                    ),
+                )
+
+            with sftp.file(resolved_path, "rb") as remote_file:
+                data = remote_file.read(max_bytes + 1)
+
+            if len(data) > max_bytes:
+                return BinaryFileContent(
+                    path=resolved_path,
+                    size=len(data),
+                    error=(
+                        f"File is larger than the {max_bytes} byte limit: "
+                        f"{resolved_path}"
+                    ),
+                )
+
+            logger.info(f"Successfully read {len(data)} bytes from {resolved_path}.")
+            return BinaryFileContent(path=resolved_path, data=data, size=len(data))
+        except FileNotFoundError:
+            logger.error(f"Remote file not found: {remote_path}")
+            return BinaryFileContent(
+                path=remote_path, error=f"Remote file not found: {remote_path}"
+            )
+        except PermissionError:
+            logger.warning(f"SFTP permission denied for {remote_path}.")
+            return BinaryFileContent(
+                path=remote_path, error=f"Permission denied: {remote_path}"
+            )
+        except Exception as e:
+            logger.error(
+                f"Error reading binary file {remote_path} on {session_key}: {e!s}",
+                exc_info=True,
+            )
+            return BinaryFileContent(
+                path=remote_path, error=f"Error reading remote file: {e!s}"
+            )
+        finally:
+            if sftp:
+                try:
+                    sftp.close()
+                except Exception:
+                    pass
 
     async def write_file(
         self,
