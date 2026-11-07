@@ -74,6 +74,7 @@ def _parse_png(data: bytes) -> ImageInfo:
     width = 0
     height = 0
     seen_ihdr = False
+    seen_idat = False
 
     for _ in range(_MAX_CHUNKS):
         if pos + 12 > len(data):
@@ -94,7 +95,11 @@ def _parse_png(data: bytes) -> ImageInfo:
             if expected_crc != actual_crc:
                 raise ImageValidationError("PNG IHDR checksum mismatch")
             seen_ihdr = True
+        elif chunk_type == b"IDAT":
+            seen_idat = True
         elif chunk_type == b"IEND":
+            if not seen_idat:
+                raise ImageValidationError("PNG has no image data")
             return ImageInfo("image/png", width, height)
 
         pos = chunk_end
@@ -150,12 +155,64 @@ def _parse_jpeg(data: bytes) -> ImageInfo:
 def _parse_gif(data: bytes) -> ImageInfo:
     if len(data) < 14:
         raise ImageValidationError("truncated GIF header")
-    if not data.rstrip(b"\x00").endswith(b"\x3b"):
-        raise ImageValidationError("GIF has no trailer")
 
     width = int.from_bytes(data[6:8], "little")
     height = int.from_bytes(data[8:10], "little")
-    return ImageInfo("image/gif", width, height)
+
+    flags = data[10]
+    pos = 13
+    if flags & 0x80:
+        pos += 3 * (2 ** ((flags & 0x07) + 1))
+
+    seen_image = False
+    while pos < len(data):
+        block = data[pos]
+
+        if block == 0x3B:
+            if not seen_image:
+                raise ImageValidationError("GIF has no image data")
+            return ImageInfo("image/gif", width, height)
+
+        if block == 0x21:
+            if pos + 1 >= len(data):
+                raise ImageValidationError("truncated GIF extension")
+            pos, _ = _skip_gif_sub_blocks(data, pos + 2)
+            continue
+
+        if block == 0x2C:
+            if pos + 10 > len(data):
+                raise ImageValidationError("truncated GIF image descriptor")
+            local_flags = data[pos + 9]
+            pos += 10
+            if local_flags & 0x80:
+                pos += 3 * (2 ** ((local_flags & 0x07) + 1))
+            if pos >= len(data):
+                raise ImageValidationError("truncated GIF image data")
+            pos, size = _skip_gif_sub_blocks(data, pos + 1)
+            if size == 0:
+                raise ImageValidationError("GIF image has no data")
+            seen_image = True
+            continue
+
+        raise ImageValidationError("unknown GIF block")
+
+    raise ImageValidationError("GIF has no trailer")
+
+
+def _skip_gif_sub_blocks(data: bytes, pos: int) -> tuple[int, int]:
+    """Skip a GIF sub-block chain, returning the next position and data size."""
+    total = 0
+    while True:
+        if pos >= len(data):
+            raise ImageValidationError("truncated GIF sub-block")
+        size = data[pos]
+        pos += 1
+        if size == 0:
+            return pos, total
+        if pos + size > len(data):
+            raise ImageValidationError("truncated GIF sub-block body")
+        total += size
+        pos += size
 
 
 def _parse_webp(data: bytes) -> ImageInfo:
@@ -163,20 +220,27 @@ def _parse_webp(data: bytes) -> ImageInfo:
         raise ImageValidationError("truncated WebP header")
 
     riff_size = int.from_bytes(data[4:8], "little")
-    if riff_size + 8 > len(data):
+    riff_end = riff_size + 8
+    if riff_end > len(data):
         raise ImageValidationError("WebP RIFF size exceeds payload")
+    if riff_end < 20:
+        raise ImageValidationError("WebP RIFF size too small for a chunk")
 
     chunk_type = data[12:16]
+    chunk_size = int.from_bytes(data[16:20], "little")
+    chunk_end = 20 + chunk_size
+    if chunk_end > riff_end:
+        raise ImageValidationError("WebP chunk exceeds RIFF payload")
 
     if chunk_type == b"VP8X":
-        if len(data) < 30:
+        if chunk_size < 10 or len(data) < 30:
             raise ImageValidationError("truncated WebP VP8X header")
         width = int.from_bytes(data[24:27], "little") + 1
         height = int.from_bytes(data[27:30], "little") + 1
         return ImageInfo("image/webp", width, height)
 
     if chunk_type == b"VP8 ":
-        if len(data) < 30:
+        if chunk_size < 10 or len(data) < 30:
             raise ImageValidationError("truncated WebP VP8 frame")
         if data[23:26] != b"\x9d\x01\x2a":
             raise ImageValidationError("WebP VP8 start code missing")
@@ -185,7 +249,7 @@ def _parse_webp(data: bytes) -> ImageInfo:
         return ImageInfo("image/webp", width, height)
 
     if chunk_type == b"VP8L":
-        if len(data) < 25:
+        if chunk_size < 5 or len(data) < 25:
             raise ImageValidationError("truncated WebP VP8L frame")
         if data[20] != 0x2F:
             raise ImageValidationError("WebP VP8L signature missing")

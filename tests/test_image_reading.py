@@ -60,7 +60,16 @@ def make_jpeg(width: int = 2, height: int = 3) -> bytes:
 
 
 def make_gif(width: int = 4, height: int = 5) -> bytes:
-    return b"GIF89a" + struct.pack("<HH", width, height) + b"\x00\x00\x00" + b"\x3b"
+    descriptor = b"\x2c" + struct.pack("<HHHH", 0, 0, width, height) + b"\x00"
+    image_data = b"\x02" + b"\x02\x4c\x01" + b"\x00"
+    return (
+        b"GIF89a"
+        + struct.pack("<HH", width, height)
+        + b"\x00\x00\x00"
+        + descriptor
+        + image_data
+        + b"\x3b"
+    )
 
 
 def make_webp_vp8l(width: int = 7, height: int = 9) -> bytes:
@@ -116,6 +125,19 @@ def test_jpeg_without_eoi_is_rejected():
 def test_gif_without_trailer_is_rejected():
     with pytest.raises(ImageValidationError):
         sniff(make_gif()[:-1])
+
+
+def test_gif_without_image_data_is_rejected():
+    header_only = b"GIF89a" + struct.pack("<HH", 4, 5) + b"\x00\x00\x00" + b"\x3b"
+    with pytest.raises(ImageValidationError):
+        sniff(header_only)
+
+
+def test_png_without_idat_is_rejected():
+    ihdr = struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0)
+    data = b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", ihdr) + _png_chunk(b"IEND", b"")
+    with pytest.raises(ImageValidationError):
+        sniff(data)
 
 
 def test_text_is_rejected():

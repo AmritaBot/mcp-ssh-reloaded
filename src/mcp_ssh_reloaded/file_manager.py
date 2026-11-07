@@ -236,6 +236,9 @@ class FileManager:
         sftp = None
         try:
             sftp = client.open_sftp()
+            channel = sftp.get_channel()
+            if timeout and channel is not None:
+                channel.settimeout(timeout)
             resolved_path = self._resolve_sftp_path(sftp, remote_path)
             attrs = sftp.stat(resolved_path)
             if attrs.st_mode is not None and stat.S_ISDIR(attrs.st_mode):

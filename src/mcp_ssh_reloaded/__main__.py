@@ -92,6 +92,8 @@ def _add_config_args(parser: argparse.ArgumentParser, prefix: str = "") -> None:
     )
     group.add_argument(
         "--enable-image-reading",
+        nargs="?",
+        const=True,
         type=lambda v: v.lower() in ("1", "true", "yes", "on"),
         default=None,
         help=(
