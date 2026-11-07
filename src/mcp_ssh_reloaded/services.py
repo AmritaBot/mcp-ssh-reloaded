@@ -238,11 +238,7 @@ class SSHService:
         max_bytes: int | None = None,
         timeout: int | None = None,
     ) -> ImagePayload:
-        """Read a remote image and validate it before it reaches the client.
-
-        Only complete PNG, JPEG, GIF and WebP payloads are accepted. Anything
-        else raises SSHError with an unsupported-format message.
-        """
+        """Read and validate a remote image before it reaches the client."""
         byte_limit = self.config.max_image_bytes
         if max_bytes is not None:
             byte_limit = min(max_bytes, byte_limit)

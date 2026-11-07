@@ -1,9 +1,4 @@
-"""Sniff and validate image payloads before they reach an MCP client.
-
-Acceptance is decided by magic bytes and container structure only; a file
-extension or a caller-supplied MIME type is never trusted. A payload that is
-not a complete, parseable PNG, JPEG, GIF or WebP is rejected as unsupported.
-"""
+"""Sniff and validate PNG, JPEG, GIF and WebP payloads by magic bytes and container structure."""
 
 from __future__ import annotations
 
@@ -39,11 +34,7 @@ def sniff_image(
     max_pixels: int,
     max_dimension: int = DEFAULT_MAX_DIMENSION,
 ) -> ImageInfo:
-    """Return format and dimensions, or raise ImageValidationError.
-
-    The signature, the container structure and the declared size must agree.
-    Truncated or malformed payloads are rejected rather than handed to a client.
-    """
+    """Return format and dimensions, or raise ImageValidationError."""
     if not data:
         raise ImageValidationError("empty payload")
 

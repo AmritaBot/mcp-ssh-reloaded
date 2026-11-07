@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import struct
 import zlib
 from typing import Any, cast
@@ -112,7 +113,7 @@ def test_png_without_iend_is_rejected():
 
 def test_broken_png_crc_is_rejected():
     data = bytearray(make_png())
-    data[-5] ^= 0xFF
+    data[30] ^= 0xFF
     with pytest.raises(ImageValidationError):
         sniff(bytes(data))
 
@@ -217,7 +218,9 @@ def test_tool_returns_image_content(monkeypatch):
     monkeypatch.setattr(server, "_svc", _FakeServerService(payload=payload))
     result = asyncio.run(server.read_image("host", "/tmp/a.png"))
     assert isinstance(result, Image)
-    assert result.to_image_content().mimeType == "image/png"
+    content = result.to_image_content()
+    assert content.mimeType == "image/png"
+    assert base64.b64decode(content.data) == payload.data
 
 
 def test_tool_returns_error_text_on_rejection(monkeypatch):

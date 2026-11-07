@@ -35,6 +35,9 @@ def configure_server(config: ServerConfig | None = None) -> None:
     if _config.enable_image_reading and not _image_tool_registered:
         mcp.add_tool(read_image)
         _image_tool_registered = True
+    elif not _config.enable_image_reading and _image_tool_registered:
+        mcp.local_provider.remove_tool("read_image")
+        _image_tool_registered = False
 
 
 def _service() -> SSHService:
@@ -236,12 +239,7 @@ async def read_image(
     max_bytes: int | None = None,
     timeout: int | None = None,
 ) -> Image | str:
-    """Experimental: read a remote image and return it as MCP image content.
-
-    The payload must be a complete PNG, JPEG, GIF or WebP file. Magic bytes and
-    container structure are checked; anything else is rejected as an
-    unsupported image format.
-    """
+    """Experimental: read a remote PNG, JPEG, GIF or WebP as MCP image content."""
     try:
         payload = await _service().read_image(
             _conn(host, username, password, key_filename, port),
