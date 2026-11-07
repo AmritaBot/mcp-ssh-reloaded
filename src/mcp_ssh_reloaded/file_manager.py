@@ -229,10 +229,12 @@ class FileManager:
         _, _, _, _, session_key = self._session_manager._resolve_connection(
             host, username, port
         )
+        # TODO: cold-start sessions serialize on registry.lock; revisit separately.
         client = await self._session_manager.get_or_create_session(
             host, username, password, key_filename, port
         )
 
+        # TODO: synchronous SFTP calls block the event loop; move them to a thread later.
         sftp = None
         try:
             sftp = client.open_sftp()
