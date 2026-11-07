@@ -11,8 +11,9 @@ import json
 from fastmcp import FastMCP
 from fastmcp.utilities.types import Image
 
-from .api_types import ConnectionParams, ServerConfig
+from .api_types import ConnectionParams, ServerConfig, SSHError
 from .error_handler import ErrorHandler
+from .models import ErrorInfo
 from .services import SSHService
 
 mcp = FastMCP("ssh-session")
@@ -587,5 +588,15 @@ async def get_performance_metrics() -> str:
 
 def _fmt_error(exc: Exception) -> str:
     """Format an exception for MCP response."""
+    if isinstance(exc, SSHError):
+        einfo = ErrorInfo(
+            category=exc.category,
+            message=exc.message,
+            original_error=exc.detail or exc.message,
+            troubleshooting_hint=ErrorHandler.TROUBLESHOOTING_HINTS.get(exc.category),
+            suggest_action=ErrorHandler.SUGGESTED_ACTIONS.get(exc.category),
+        )
+        return ErrorHandler.format_error_for_ai(einfo)
+
     einfo = ErrorHandler.categorize_error(str(exc), exc)
     return ErrorHandler.format_error_for_ai(einfo)
